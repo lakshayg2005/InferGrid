@@ -68,9 +68,29 @@ python scripts/benchmark.py            # ~6 minutes; results saved to bench/resu
 Every routing policy gets a fresh 4-worker cluster and the identical workload
 (multi-turn chats sharing long system prompts, open-loop Poisson arrivals).
 
-It compares round-robin, least-loaded, and consistent hashing with and without the
-load bound, reporting time-to-first-token percentiles, prefix-cache hit rate, tokens
-recomputed, and load imbalance.
+### Results (4 simulated workers, 3 different workloads, 1,330 requests per router; mean with min–max range)
+
+| Router | TTFT p50 | TTFT p99 | Cache hit rate | Tokens recomputed | Busiest worker vs avg |
+|---|---|---|---|---|---|
+| round_robin | 94 ms (94–94) | 298 ms (284–315) | 79.1% | 66,476 | 1.00× |
+| least_loaded | 95 ms (94–95) | 361 ms (283–421) | 79.1% | 66,359 | 1.02× |
+| consistent_hash, no bound | 65 ms (64–67) | 1071 ms (826–1479) | 92.5% | 23,905 | 1.36× |
+| **consistent_hash, ε = 0.25** | **64 ms (64–64)** | 414 ms (347–502) | 88.2% | 37,516 | 1.07× |
+
+Raw per-request data: [bench/results/](bench/results/). Reproduce with `python scripts/benchmark.py --repeats 3`.
+
+**What this shows**
+
+- Cache-aware routing with bounded loads cuts median time-to-first-token by **32%**
+  and the prefill work the cluster does by **44%** compared with round-robin.
+- Without the load bound, 27 of the 28 slowest requests landed on a single hot
+  worker and waited in its queue (they had a median of only 47 uncached tokens).
+  The bound cuts p99 from 1071 ms to 414 ms while keeping the median gain.
+- **Open problem:** p99 is still ~40% above round-robin. The slowest requests
+  remain queueing delays, not recomputation. The bound counts requests, but at
+  ε = 0.25 a busy worker may accept more requests than it has concurrency slots
+  while other workers have free ones. Making the bound aware of each worker's
+  capacity is the next experiment.
 
 ## Tests
 
