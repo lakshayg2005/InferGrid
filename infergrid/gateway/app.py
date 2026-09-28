@@ -259,6 +259,19 @@ def create_app(
         alive = set(membership.alive_http_urls())
         return [w for w in workers if w in alive] or workers
 
+    def sync_capacities() -> None:
+        """Push each alive worker's real capacity (gossiped over SWIM) into the router.
+
+        Only ConsistentHashRouter uses this (duck-typed, so other routers are
+        unaffected); see its docstring for why this matters over an average-based
+        bound. A no-op without membership, since there is nothing to sync from.
+        """
+        if membership is None or not hasattr(router, "set_capacities"):
+            return
+        router.set_capacities({m.metadata["http_url"]: m.metadata["capacity"]
+                               for m in membership.alive_members()
+                               if "http_url" in m.metadata and "capacity" in m.metadata})
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         if membership is not None:
@@ -291,6 +304,7 @@ def create_app(
 
         request_id = uuid.uuid4().hex
         gen_req = GenerateRequest(request_id=request_id, messages=body.messages, max_tokens=body.max_tokens)
+        sync_capacities()
         candidates = router.candidates(gen_req, alive_workers(), load.in_flight)
 
         if hedge_delay_ms:

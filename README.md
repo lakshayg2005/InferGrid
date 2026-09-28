@@ -70,29 +70,39 @@ python scripts/benchmark.py            # ~6 minutes; results saved to bench/resu
 Every routing policy gets a fresh 4-worker cluster and the identical workload
 (multi-turn chats sharing long system prompts, open-loop Poisson arrivals).
 
-### Results (4 simulated workers, 3 different workloads, 1,330 requests per router; mean with min–max range)
+### Results (4 simulated workers, 3 different workloads, ~1,330 requests per router; mean with min–max range)
 
 | Router | TTFT p50 | TTFT p99 | Cache hit rate | Tokens recomputed | Busiest worker vs avg |
 |---|---|---|---|---|---|
-| round_robin | 94 ms (94–94) | 298 ms (284–315) | 79.1% | 66,476 | 1.00× |
-| least_loaded | 95 ms (94–95) | 361 ms (283–421) | 79.1% | 66,359 | 1.02× |
-| consistent_hash, no bound | 65 ms (64–67) | 1071 ms (826–1479) | 92.5% | 23,905 | 1.36× |
-| **consistent_hash, ε = 0.25** | **64 ms (64–64)** | 414 ms (347–502) | 88.2% | 37,516 | 1.07× |
+| round_robin | 94 ms (93–95) | 311 ms (266–360) | 79.3% | 66,081 | 1.00× |
+| least_loaded | 94 ms (94–95) | 297 ms (280–313) | 79.1% | 66,353 | 1.01× |
+| consistent_hash, no bound | 64 ms (64–65) | 1088 ms (799–1544) | 92.5% | 23,905 | 1.36× |
+| **consistent_hash, ε = 0.25** | **66 ms (64–69)** | 505 ms (374–673) | 88.1% | 37,580 | 1.08× |
 
 Raw per-request data: [bench/results/](bench/results/). Reproduce with `python scripts/benchmark.py --repeats 3`.
+SWIM membership (Phase 3) is deliberately disabled for this benchmark — its own
+background traffic is a real cost, but not one this benchmark is measuring; see
+`scripts/benchmark.py`'s docstring.
 
 **What this shows**
 
-- Cache-aware routing with bounded loads cuts median time-to-first-token by **32%**
-  and the prefill work the cluster does by **44%** compared with round-robin.
-- Without the load bound, 27 of the 28 slowest requests landed on a single hot
-  worker and waited in its queue (they had a median of only 47 uncached tokens).
-  The bound cuts p99 from 1071 ms to 414 ms while keeping the median gain.
-- **Open problem:** p99 is still ~40% above round-robin. The slowest requests
-  remain queueing delays, not recomputation. The bound counts requests, but at
-  ε = 0.25 a busy worker may accept more requests than it has concurrency slots
-  while other workers have free ones. Making the bound aware of each worker's
-  capacity is the next experiment.
+- Cache-aware routing with bounded loads cuts median time-to-first-token by
+  **~30%** and the prefill work the cluster does by **~43%** compared with
+  round-robin.
+- Without the load bound, the slowest 2% of requests concentrate heavily on a
+  single hot worker with a median of only 52 uncached tokens — confirming
+  they're queueing delays, not recomputation. The bound cuts p99 by roughly
+  half compared with no bound.
+- **Open problem, still unresolved:** p99 remains above round-robin's. A
+  capacity-aware version of this bound now exists (`Router.set_capacities()`,
+  used when SWIM is enabled) and is verified to fix a related failure-mode in
+  `scripts/chaos.py` — but this benchmark runs with membership off, by design,
+  and even where it's on, the fix targets the "candidate set shrinks" failure
+  mode, not this steady-state one. The queueing pattern above is consistent
+  with `epsilon` being too generous relative to real worker concurrency
+  (`max_concurrency=4` per simulated worker); tightening it, or basing the
+  bound on `max_concurrency` even in the no-membership case, is the next
+  experiment.
 
 ## Chaos test
 
@@ -111,38 +121,49 @@ checked word for word against the answer the simulator gives when nothing fails.
 
 | Run | Requests | Answers lost | Answers corrupted | Mid-stream failovers | TTFT p50 | TTFT p99 |
 |---|---|---|---|---|---|---|
-| nothing (baseline) | 465 | 14 (3.0%) | 0 | 0 | 80 ms | 2746 ms |
-| failover only | 504 | 0 (0.0%) | 0 | 17 | 93 ms | 2557 ms |
-| failover + membership | 504 | **0 (0.0%)** | 0 | **8** | 159 ms | 3604 ms |
+| nothing (baseline) | 471 | 16 (3.4%) | 0 | 0 | 80 ms | 2600 ms |
+| failover only | 504 | 0 (0.0%) | 0 | 16 | 89 ms | 2767 ms |
+| **failover + membership** | 504 | **0 (0.0%)** | 0 | 18 | 94 ms | **2540 ms** |
 
 **What this shows**
 
 - Mid-stream failover alone already gets answers to 0% lost, by resuming on
-  another worker whenever a crash is noticed. SWIM cuts *how often that noticing
-  has to happen at all*: mid-stream failovers fall from 17 to 8, since routing
-  now avoids a worker once it's known dead, instead of finding out mid-answer.
-- **A real bug found and fixed along the way:** SWIM's first timeouts (150 ms
-  ping, 1 s suspicion) were copied from this project's own fast unit tests,
-  which run many nodes in one lightly-loaded process. Run for real as separate
-  OS processes also serving inference traffic, those timeouts caused false
-  positives — a chaos run showed only 1 of 4 workers still marked alive by the
-  end, with no matching kill in the schedule. `membership/swim.py`'s defaults
-  are now 500 ms / 2 s, with a wider indirect-ping budget; see section 3.4 of
-  [DESIGN.md](DESIGN.md) for the full account.
-- **Open problem, and it connects to the router's:** tail latency with
-  membership is *worse* (3604 ms vs 2557 ms), not better. This cluster has no
-  spare capacity — it's sized for 4 workers' worth of load, not 3 — so
-  correctly routing around a dead worker piles its full share onto the
-  survivors for the length of the outage. "Failover only" coincidentally
-  avoids this: its bounded-load math still divides by the stale count of 4,
-  spreading load thinner even though some of it is wasted on doomed connection
-  attempts to the dead worker. That is the same root cause as Phase 2's open
-  problem — the load bound isn't capacity-aware — so fixing it (weighting the
-  bound by each worker's `max_concurrency` rather than a flat per-worker cap)
-  is the next experiment for both.
-- Nothing here is a reliability regression: 0 answers lost or corrupted with
-  membership on, in every run. It's a latency effect of running at capacity
-  with one fewer worker, not a bug.
+  another worker whenever a crash is noticed. With membership on top, p99 drops
+  a further ~8% (2767 ms → 2540 ms), and 0 answers are lost or corrupted in
+  either case, all 5 kills across the run.
+- **Two real bugs found and fixed getting to this result, both via this chaos
+  test catching a symptom no unit test would have:**
+  1. *False positives.* SWIM's first timeouts (150 ms ping, 1 s suspicion) were
+     copied from this project's own fast unit tests, which run many nodes in
+     one lightly-loaded process. Run for real as separate OS processes also
+     serving inference traffic, those timeouts caused healthy workers to be
+     marked dead under ordinary scheduling jitter — a chaos run showed only
+     1 of 4 workers still marked alive by the end, with no matching kill in
+     the schedule. Fixed by loosening the defaults to 500 ms / 2 s with a
+     wider indirect-ping budget.
+  2. *Stuck-dead restarts.* A restarted worker is a brand-new `SwimNode` with
+     no memory of its old incarnation number. Per SWIM's own merge rule, an
+     ALIVE claim at the same incarnation a peer last recorded as DEAD is
+     rejected — so a revived worker could stay marked dead forever unless it
+     got lucky and heard a peer re-gossip its death within a narrow window (a
+     race, not a guarantee). A chaos run showed `alive_workers` stuck at 2 of 4
+     long after every kill should have recovered. Fixed by seeding a node's
+     incarnation from the current time rather than 0, which is essentially
+     guaranteed to exceed anything a peer last remembered.
+  3. *A capacity-aware load bound was also added* (`Router.set_capacities()`,
+     `gateway/router.py`): when membership is on, each worker gossips its real
+     `max_concurrency`, and the router's bound is anchored to a worker's own
+     capacity rather than the cluster average — so losing a worker no longer
+     silently raises what the survivors are allowed to carry. This is what
+     turned membership's tail-latency effect from worse to better.
+- `tests/test_swim.py::test_a_restarted_node_...` is a genuine regression test
+  for bug 2: it force-exhausts the "lucky" refutation path and is confirmed to
+  fail on the pre-fix code. See DESIGN.md section 3.4 for the full account.
+- This is a single run, not averaged over repeated seeds like the routing
+  benchmark above; the exact numbers have shown real run-to-run variance
+  across earlier attempts documented in git history, though the *shape* of the
+  result (0 lost/corrupted, membership improving rather than hurting p99) has
+  been consistent since both fixes landed.
 
 ## Tests
 

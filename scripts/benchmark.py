@@ -8,7 +8,11 @@ Each policy gets a fresh cluster (empty caches) and the exact same workload from
 infergrid.loadgen: multi-turn chats sharing long system prompts, open-loop arrivals.
 
 Simulated workers are deterministic, so every policy sees identical replies and
-therefore identical prompts: the only thing that differs is the routing.
+therefore identical prompts: the only thing that differs is the routing. SWIM
+membership (Phase 3) is deliberately left off here -- its background gossip
+traffic is a real but unrelated cost that would otherwise confound a benchmark
+whose whole point is isolating routing-policy quality; scripts/chaos.py is
+where membership's own effect is measured.
 """
 
 import argparse
@@ -113,8 +117,8 @@ def main() -> None:
         for name, epsilon in policies:
             label = name if name != "consistent_hash" else f"consistent_hash (eps={epsilon:g})"
             port += 20  # fresh ports per run, so a slow shutdown never collides
-            with LocalCluster(workers=args.workers, router=name, epsilon=epsilon, gateway_port=port,
-                              worker_base_port=port + 1, quiet=True) as cluster:
+            with LocalCluster(workers=args.workers, router=name, epsilon=epsilon, membership=False,
+                              gateway_port=port, worker_base_port=port + 1, quiet=True) as cluster:
                 print(f"  running {label} ...", flush=True)
                 records, wall = asyncio.run(run_workload(cluster.gateway_url, workload, args.max_tokens))
             summary = summarize(PolicyResult(label, records, wall))

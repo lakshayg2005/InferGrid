@@ -40,7 +40,8 @@ def main() -> None:
     if args.swim_port:
         seeds = [s.strip() for s in args.seeds.split(",") if s.strip()]
         membership = SwimNode(f"{args.host}:{args.swim_port}", seeds=seeds,
-                              metadata={"http_url": f"http://{args.host}:{args.port}"})
+                              metadata={"http_url": f"http://{args.host}:{args.port}",
+                                        "capacity": backend.max_concurrency})
 
     print(f"{args.id}: {args.backend} backend on http://{args.host}:{args.port}"
           + (f", swim on {args.host}:{args.swim_port}" if membership else ""))

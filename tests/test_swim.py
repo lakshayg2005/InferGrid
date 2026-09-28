@@ -156,3 +156,37 @@ async def test_alive_http_urls_only_includes_live_members_with_metadata(cluster:
     await b.stop()
     assert await wait_until(lambda: a.members[b.addr].state == DEAD)
     assert "http://b" not in a.alive_http_urls()
+
+
+async def test_a_restarted_node_at_the_same_address_is_seen_alive_again(cluster: Cluster):
+    """The bug this guards against: a node that crashed and came back with no memory
+    of its previous incarnation must not be stuck DEAD forever in its peers' eyes.
+
+    A revived node announcing itself at the same incarnation its peer last recorded
+    it DEAD at is rejected by SWIM's own merge rule (equal incarnation: worse news
+    wins) -- unless the peer is still actively re-gossiping "it's dead" at that exact
+    moment, which triggers the revived node to self-refute by bumping its incarnation.
+    That's a lucky race, not a guarantee: once a peer's retransmit budget for that
+    gossip entry is spent, it stops re-announcing it, yet still holds the address as
+    DEAD forever, since a DEAD member is never re-probed. `a`'s buffer is force-
+    exhausted below (deleting the entry, exactly as happens once its transmit count
+    naturally reaches zero) to test the real fix -- a higher starting incarnation --
+    rather than the lucky path this test could otherwise pass on by accident.
+    """
+    a = cluster.add()
+    observer = cluster.add(seeds=[a.addr])
+    dead_addr = observer.addr
+    await cluster.start()
+    assert await wait_until(lambda: len(a.alive_members()) == 2 and len(observer.alive_members()) == 2)
+
+    await observer.stop()
+    assert await wait_until(lambda: a.members[dead_addr].state == DEAD)
+    a._gossip = {k: v for k, v in a._gossip.items() if k[0] != dead_addr}  # force-exhaust: no lucky refutation
+
+    # A brand-new SwimNode at the same address: no memory of the old incarnation.
+    revived = SwimNode(dead_addr, seeds=[a.addr], **FAST)
+    cluster.nodes.append(revived)
+    await revived.start()
+    assert await wait_until(lambda: a.members[dead_addr].state == ALIVE, timeout=5), (
+        "a restarted node must eventually be seen alive again, not stuck dead forever"
+    )

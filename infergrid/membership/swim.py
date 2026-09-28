@@ -87,8 +87,19 @@ class SwimNode(asyncio.DatagramProtocol):
         self.suspicion_timeout = suspicion_timeout
         self.gossip_retransmits = gossip_retransmits
 
-        self.incarnation = 0
-        self.members: dict[str, Member] = {addr: Member(addr, ALIVE, 0, dict(metadata or {}))}
+        # A restarted process is a brand-new SwimNode with no memory of its previous
+        # incarnation. If it started back at 0, SWIM's own merge rule (_is_newer)
+        # would keep it stuck: peers who last heard it was DEAD at incarnation N
+        # never accept an ALIVE claim at an incarnation no higher than N, and a
+        # crashed-and-restarted process has no way to know what N was. Seeding from
+        # the current time instead of 0 sidesteps this without persisting state to
+        # disk: nanosecond resolution keeps two restarts of the same node from
+        # landing on the same incarnation even seconds-scale wall-clock time would
+        # not distinguish (this project's own fast-settings test suite runs many
+        # SWIM rounds within a single wall-clock second, and did exactly that with
+        # second resolution -- a real, reproducible flake, not a hypothetical one).
+        self.incarnation = time.time_ns()
+        self.members: dict[str, Member] = {addr: Member(addr, ALIVE, self.incarnation, dict(metadata or {}))}
         self._gossip: dict[tuple[str, str, int], int] = {}  # (addr, state, incarnation) -> transmits left
 
         self._transport: asyncio.DatagramTransport | None = None

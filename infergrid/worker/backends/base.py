@@ -12,6 +12,7 @@ class Backend(ABC):
     """An inference engine a worker serves requests from."""
 
     name: str
+    max_concurrency: int  # requests this backend can actually process at once; gossiped over SWIM
     max_queue: int  # admission limit: queue_depth() at or above this is refused, not queued
 
     @abstractmethod

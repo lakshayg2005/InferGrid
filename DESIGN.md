@@ -82,9 +82,19 @@ OpenAI SDK works against it unchanged.
 - **Load view.** Each gateway counts the requests it has in flight on each
   worker, reserving a slot *before* connecting so a burst of simultaneous
   requests cannot all pick the same idle-looking worker. With several
-  gateways each sees only its own share, not a cluster-wide total — Phase 3
-  adds SWIM (section 3.4) for *liveness*, but load itself still is not
+  gateways each sees only its own share, not a cluster-wide total — SWIM
+  (section 3.4) gives liveness cluster-wide, but load itself still is not
   gossiped between gateways; that remains a known gap for a future phase.
+- **Capacity-aware bound.** Each worker also gossips its real capacity
+  (`max_concurrency`) as SWIM metadata. When membership is enabled, the
+  router anchors a worker's bound to *its own* capacity
+  (`ceil((1 + ε) × that worker's capacity)`) instead of the cluster average;
+  without membership (or before any worker has reported one), it falls back
+  to the average-based bound described above. This closes the gap explained
+  in section 3.4: an average-based bound rises for the survivors the moment
+  a worker is excluded, with no floor at what they can actually process
+  concurrently, which is what made the chaos test's tail latency worse, not
+  better, the first time SWIM was added.
 - Baselines for comparison: round-robin (ignores load and cache) and least-loaded
   (perfect balance, ignores cache).
 
@@ -116,45 +126,57 @@ Every worker and the gateway run **SWIM** (Das, Gupta and Motivala, 2002;
   suspicion timeout (default 2 s). Worst case, a real crash takes a few
   seconds to become DEAD; a healthy member routinely refutes far sooner.
 
-  **This margin was tuned up from an initial, tighter version the hard way.**
-  A first pass used the textbook-scale timeouts from this project's own unit
-  tests (150 ms ping timeout, 1 s suspicion) — those tests run many SWIM nodes
-  in one lightly-loaded process, where that is plenty of margin. Run for real
-  as separate OS processes competing for CPU while also serving inference
-  traffic, those timeouts produced false positives: healthy workers missed a
-  ping under ordinary scheduling jitter and got marked dead, and
-  `scripts/chaos.py` caught it immediately (`alive_workers` dropped to 1 of 4
-  by the end of a run, with no matching kill in the schedule). The fix was
-  more realistic timeouts for a real (not unit-tested) environment, plus
-  more slack on the indirect-ping budget, which has two hops of network delay
-  in addition to the helper's own ping.
+  This margin, and the fix below, were both tuned up the hard way, by two real
+  bugs `scripts/chaos.py` caught that no unit test would have:
+
+  **Bug 1: false positives.** A first pass used the textbook-scale timeouts
+  from this project's own unit tests (150 ms ping, 1 s suspicion) — those
+  tests run many SWIM nodes in one lightly-loaded process, where that is
+  plenty of margin. Run for real as separate OS processes competing for CPU
+  while also serving inference traffic, those timeouts produced false
+  positives: healthy workers missed a ping under ordinary scheduling jitter
+  and got marked dead, and a chaos run showed `alive_workers` at 1 of 4 by the
+  end, with no matching kill in the schedule. Fixed with the more forgiving
+  defaults above, plus more slack on the indirect-ping budget (it has two
+  network hops in addition to the helper's own ping).
+
+  **Bug 2: a restarted worker could stay marked dead forever.** A restarted
+  process is a brand-new `SwimNode` with no memory of its previous incarnation
+  number. SWIM's own merge rule rejects an ALIVE claim at an incarnation no
+  higher than what a peer last recorded as DEAD — so a revived worker
+  announcing itself at incarnation 0 again could be silently ignored by any
+  peer still holding it as DEAD, unless it got lucky and heard that peer
+  re-gossip its death within a narrow window before that gossip entry's
+  retransmit budget ran out (a race, not a guarantee). A chaos run showed
+  `alive_workers` stuck at 2 of 4 long after every kill should have recovered.
+  Fixed by seeding a node's incarnation from the current time (nanoseconds,
+  not just seconds -- this project's own fast-settings test suite runs many
+  SWIM rounds within a single wall-clock second, and a first, seconds-resolution
+  version of this fix landed exactly on that collision, a real and repeatable
+  flake caught by running the full suite a handful of times) instead of 0 —
+  essentially guaranteed to exceed whatever small counter value any peer last
+  remembered. `tests/test_swim.py::test_a_restarted_node_...` is a genuine
+  regression test for this: it force-exhausts the lucky path and is confirmed
+  to fail on the pre-fix code.
 - Membership changes piggyback on ping/ack messages already being sent
   (infection-style gossip), so the whole group learns about joins and deaths
   without a central registry and without a separate gossip round.
-- Each member advertises metadata (its HTTP URL); the gateway reads
-  `alive_http_urls()` from its own SWIM view and only routes to workers it
-  currently believes are alive, filtering them out of `router.candidates()`
-  before ever attempting a connection.
+- Each member advertises metadata (its HTTP URL and its real capacity, see
+  3.2's capacity-aware bound); the gateway reads `alive_http_urls()` from its
+  own SWIM view and only routes to workers it currently believes are alive,
+  filtering them out of `router.candidates()` before ever attempting a
+  connection.
 
 **Why this matters over just retrying on failure:** without it, every request
 routed to an already-dead worker pays a full connect/HTTP-refused round trip
 before the gateway's existing failover even gets a chance to try someone else.
 `scripts/chaos.py`'s three-way comparison (nothing / failover only / failover +
-membership) confirms the mechanism works as designed: mid-stream failovers
-(a request that starts on a worker and has to be resumed elsewhere mid-answer)
-fall by more than half once membership routes around a worker known to be
-dead, rather than finding out partway through an answer.
-
-**What it does not fix, and why that's an interesting result, not a bug:**
-in the same chaos runs, *tail latency* with membership on is worse than with
-failover alone. This 4-worker cluster is sized for 4 workers' worth of load;
-correctly excluding a dead one piles its full share onto the 3 survivors for
-the length of the outage, and they queue. "Failover only" coincidentally
-avoids this, since its bounded-load router still divides by the stale count
-of 4, spreading load thinner even though part of it is wasted on doomed
-connection attempts to the dead worker. That is the same root cause as
-section 3.2's open problem (the load bound isn't capacity-aware) wearing a
-different hat: see section 5 for the numbers and the shared fix.
+membership) confirms the combination works: 0 answers lost or corrupted with
+membership on, in every kill, and p99 latency improves over failover alone
+once the capacity-aware bound (3.2) is also in the picture — see section 5 for
+the numbers. The exact mid-stream-failover count is noisier run to run than
+these headline numbers (only 5 kills per run), so it is reported honestly
+rather than rounded into a clean story.
 
 **A limitation, honestly:** membership only tracks the workers this gateway
 was configured with; it does not (yet) drop or add HTTP routing candidates for

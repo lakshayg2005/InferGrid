@@ -67,6 +67,7 @@ class SimBackend(Backend):
 
     def __init__(self, config: SimConfig | None = None):
         self.config = config or SimConfig()
+        self.max_concurrency = self.config.max_concurrency
         self.max_queue = self.config.max_queue
         self.cache = PrefixCache(self.config.cache_capacity_blocks, self.config.block_size)
         self._slots = asyncio.Semaphore(self.config.max_concurrency)
