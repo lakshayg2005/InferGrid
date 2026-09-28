@@ -161,6 +161,17 @@ offset committed → client polls `GET /v1/batches/{id}`.
 | Cluster overloaded | Admission control sheds lowest-priority work first (batch before interactive) |
 | Kafka consumer crashes | Uncommitted offsets redelivered; idempotent processing prevents duplicates |
 
+**Mid-stream failover in detail.** The gateway remembers every token it has
+forwarded. When a worker's stream breaks (connection reset, error event, or the
+stream ending early), it sends the same request to the next worker on the ring
+with `resume_text` (the answer so far) and `resume_tokens` (its length). The new
+worker prefills the conversation plus the partial answer and numbers its tokens
+from `resume_tokens`. The gateway forwards a token only if its index is exactly
+the next one expected: lower indices are duplicates and are dropped; a gap is
+treated as another failure. At most `max_failovers` moves are made per answer.
+`scripts/chaos.py` verifies every surviving answer word for word against the
+answer produced without failures.
+
 ## 6. Build phases
 
 | Phase | Deliverable |

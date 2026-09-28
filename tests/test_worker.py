@@ -91,3 +91,23 @@ async def test_worker_streams_indexed_tokens_then_done():
     assert [e["index"] for e in events[:-1]] == [0, 1, 2, 3]
     assert events[-1]["type"] == "done"
     assert events[-1]["usage"]["completion_tokens"] == 4
+
+
+async def test_sim_resumes_an_answer_from_a_token_index():
+    full, _ = await run(SimBackend(FAST), request("resume me", max_tokens=10))
+    pieces = [full.split(" ")[0]] + [" " + w for w in full.split(" ")[1:]]
+    resumed_req = request("resume me", max_tokens=10).model_copy(
+        update={"resume_text": "".join(pieces[:4]), "resume_tokens": 4})
+    rest, result = await run(SimBackend(FAST), resumed_req)
+    assert "".join(pieces[:4]) + rest == full
+    assert result.usage.completion_tokens == 10  # counts the whole answer
+    assert result.usage.prompt_tokens > 0
+
+
+async def test_worker_numbers_resumed_tokens_from_the_resume_point():
+    app = create_app(SimBackend(FAST), "w1")
+    req = request("hi", max_tokens=6).model_copy(update={"resume_text": "a b", "resume_tokens": 2})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://w1") as client:
+        resp = await client.post("/generate", json=req.model_dump())
+    events = [json.loads(line[6:]) for line in resp.text.splitlines() if line.startswith("data: ")]
+    assert [e["index"] for e in events[:-1]] == [2, 3, 4, 5]

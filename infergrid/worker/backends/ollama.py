@@ -24,13 +24,14 @@ class OllamaBackend(Backend):
         self._requests = 0
 
     async def generate(self, req: GenerateRequest, result: GenerationResult) -> AsyncIterator[str]:
-        payload: dict = {
-            "model": self.model,
-            "messages": [m.model_dump() for m in req.messages],
-            "stream": True,
-        }
+        messages = [m.model_dump() for m in req.messages]
+        if req.resume_tokens:
+            # Ollama continues a final assistant message instead of starting a new reply.
+            messages.append({"role": "assistant", "content": req.resume_text})
+        payload: dict = {"model": self.model, "messages": messages, "stream": True}
         if req.max_tokens:
-            payload["options"] = {"num_predict": req.max_tokens}
+            payload["options"] = {"num_predict": max(1, req.max_tokens - req.resume_tokens)}
+        result.usage.completion_tokens = req.resume_tokens
 
         self._queued += 1
         try:
@@ -58,7 +59,8 @@ class OllamaBackend(Backend):
                     if chunk.get("done"):
                         # Ollama does not report prefix-cache hits, so cached_tokens stays 0.
                         result.usage.prompt_tokens = chunk.get("prompt_eval_count", 0)
-                        result.usage.completion_tokens = chunk.get("eval_count", result.usage.completion_tokens)
+                        if "eval_count" in chunk:
+                            result.usage.completion_tokens = req.resume_tokens + chunk["eval_count"]
                         result.finish_reason = "length" if chunk.get("done_reason") == "length" else "stop"
         except httpx.TransportError as exc:
             raise BackendError(f"cannot reach ollama: {exc!r}") from exc

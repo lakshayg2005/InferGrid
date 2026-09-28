@@ -15,7 +15,7 @@ Output is deterministic for a given prompt, which keeps tests and benchmarks rep
 
 import asyncio
 import random
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 
 from infergrid.common.schemas import ChatMessage, GenerateRequest, GenerationResult
@@ -41,6 +41,22 @@ class SimConfig:
     max_output_tokens: int = 160
 
 
+def reference_answer(messages: Sequence[ChatMessage], max_tokens: int | None,
+                     config: SimConfig | None = None) -> tuple[list[str], str]:
+    """The answer the simulator gives to a conversation, as (text pieces, finish reason).
+
+    It depends only on the conversation, so every worker gives the same answer. That
+    is what lets a worker resume another's answer, and lets tests check a resumed
+    answer is exactly the uninterrupted one.
+    """
+    cfg = config or SimConfig()
+    rng = random.Random(stable_seed(prompt_tokens(messages)))
+    natural_length = rng.randint(cfg.min_output_tokens, cfg.max_output_tokens)
+    length = min(natural_length, max_tokens) if max_tokens else natural_length
+    pieces = [rng.choice(_VOCAB) if i == 0 else " " + rng.choice(_VOCAB) for i in range(length)]
+    return pieces, "length" if length < natural_length else "stop"
+
+
 class SimBackend(Backend):
     name = "sim"
 
@@ -54,10 +70,11 @@ class SimBackend(Backend):
 
     async def generate(self, req: GenerateRequest, result: GenerationResult) -> AsyncIterator[str]:
         cfg = self.config
-        tokens = prompt_tokens(req.messages)
-        rng = random.Random(stable_seed(tokens))
-        natural_length = rng.randint(cfg.min_output_tokens, cfg.max_output_tokens)
-        length = min(natural_length, req.max_tokens) if req.max_tokens else natural_length
+        pieces, finish_reason = reference_answer(req.messages, req.max_tokens, cfg)
+
+        # A resuming worker must still read (prefill) the partial answer it continues from.
+        partial = [ChatMessage(role="assistant", content=req.resume_text)] if req.resume_tokens else []
+        tokens = prompt_tokens([*req.messages, *partial])
 
         self._queued += 1
         try:
@@ -73,13 +90,13 @@ class SimBackend(Backend):
             result.usage.cached_tokens = cached
             await asyncio.sleep((len(tokens) - cached) * cfg.prefill_ms_per_token / 1000)
 
-            pieces = []
-            for i in range(length):
+            # When resuming, skip the part of the answer the failed worker already delivered.
+            result.usage.completion_tokens = min(req.resume_tokens, len(pieces))
+            for piece in pieces[req.resume_tokens:]:
                 await asyncio.sleep(cfg.decode_ms_per_token / 1000)
-                pieces.append(rng.choice(_VOCAB) if i == 0 else " " + rng.choice(_VOCAB))
                 result.usage.completion_tokens += 1
-                yield pieces[-1]
-            result.finish_reason = "length" if length < natural_length else "stop"
+                yield piece
+            result.finish_reason = finish_reason
 
             reply = ChatMessage(role="assistant", content="".join(pieces))
             self.cache.insert(prompt_tokens([*req.messages, reply]))

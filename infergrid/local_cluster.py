@@ -20,6 +20,7 @@ class _Process:
     url: str
     proc: subprocess.Popen
     is_ours: Callable[[dict], bool]  # recognises our own /health response
+    args: list[str] = field(default_factory=list)  # to restart it
 
 
 @dataclass
@@ -29,6 +30,7 @@ class LocalCluster:
     model: str = "qwen2.5:0.5b"
     router: str = "consistent_hash"
     epsilon: float = 0.25
+    max_failovers: int = 2
     gateway_port: int = 8700
     worker_base_port: int = 8701
     quiet: bool = False  # hide process output (benchmarks)
@@ -48,10 +50,11 @@ class LocalCluster:
                 self.worker_urls.append(url)
                 cmd = ["-m", "infergrid.worker", "--id", name, "--port", str(port),
                        "--backend", self.backend, "--model", self.model]
-                self._workers.append(_Process(url, self._spawn(cmd), lambda b, name=name: b.get("worker_id") == name))
+                self._workers.append(
+                    _Process(url, self._spawn(cmd), lambda b, name=name: b.get("worker_id") == name, cmd))
 
             cmd = ["-m", "infergrid.gateway", "--port", str(self.gateway_port), "--workers", ",".join(self.worker_urls),
-                   "--router", self.router, "--epsilon", str(self.epsilon)]
+                   "--router", self.router, "--epsilon", str(self.epsilon), "--max-failovers", str(self.max_failovers)]
             self._gateway = _Process(self.gateway_url, self._spawn(cmd), lambda b: b.get("workers") == self.worker_urls)
 
             for p in [*self._workers, self._gateway]:
@@ -67,6 +70,17 @@ class LocalCluster:
             proc.terminate()
         for proc in procs:
             proc.wait()
+
+    def kill_worker(self, index: int) -> None:
+        """Kill a worker abruptly, like a machine losing power: no graceful shutdown."""
+        proc = self._workers[index].proc
+        proc.kill()
+        proc.wait()
+
+    def restart_worker(self, index: int) -> bool:
+        worker = self._workers[index]
+        worker.proc = self._spawn(worker.args)
+        return _wait_until_healthy(worker)
 
     def gateway_alive(self) -> bool:
         return self._gateway is not None and self._gateway.proc.poll() is None

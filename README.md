@@ -13,7 +13,7 @@ See [DESIGN.md](DESIGN.md) for the architecture and the reasoning behind it.
 |---|---|---|
 | 1 | Gateway + workers (simulated + Ollama), OpenAI-compatible streaming, round-robin routing, failover before first token | ✅ Done |
 | 2 | Cache-aware routing (prefix hashing + bounded-load consistent hashing), benchmarks | ✅ Done |
-| 3 | Gossip membership, mid-stream failover, hedging, load shedding, rate limiting | Next |
+| 3 | Mid-stream failover ✅ · gossip membership, load shedding, rate limiting, hedging | In progress |
 | 4 | Sharded, replicated state store | |
 | 5 | Kafka: batch inference, usage metering | |
 | 6 | Semantic cache, predictive autoscaling | |
@@ -92,6 +92,35 @@ Raw per-request data: [bench/results/](bench/results/). Reproduce with `python s
   while other workers have free ones. Making the bound aware of each worker's
   capacity is the next experiment.
 
+## Chaos test
+
+```bash
+python scripts/chaos.py                # ~3 minutes
+```
+
+Kills a random worker every 8 seconds under load (and restarts it 3 seconds later
+with an empty cache), once with mid-stream failover off and once on. Every answer
+that completes is checked word for word against the answer the simulator gives
+when nothing fails.
+
+### Results (4 workers, 7 workers killed during a 60-second run, same workload and kill schedule)
+
+| Run | Requests | Answers lost | Answers corrupted | Mid-stream failovers | TTFT p50 | TTFT p99 |
+|---|---|---|---|---|---|---|
+| failover off | 459 | 21 (4.6%) | 0 | 0 | 78 ms | 2339 ms |
+| **failover on** | 504 | **0** | **0** | 25 | 80 ms | 2448 ms |
+
+- Mid-stream failover saved every answer interrupted by a crash, with no change
+  to median latency. ("Requests" differs because a conversation stops at its
+  first lost answer.)
+- **Open problem:** p99 is ~2.4 s in both runs. 37 of the 42 requests slower
+  than 1 s were sent while a worker was down: the gateway still routes new
+  requests to the dead worker and waits for the connection to be refused
+  (about 2 s on Windows) before trying the next one. Failure detection fixes this.
+- Earlier runs with longer answers (~100% cluster utilisation) showed median
+  latency growing several-fold as queues built up while capacity was reduced by
+  crashes. Load shedding is the planned fix.
+
 ## Tests
 
 ```bash
@@ -106,7 +135,8 @@ infergrid/
   worker/          worker API, prefix cache, backends (sim, ollama)
   gateway/         gateway API, load tracking, routing policies
   local_cluster.py start/stop worker and gateway processes
-scripts/           run_local.py (start a cluster), chat.py (terminal client), benchmark.py
+  loadgen.py       realistic multi-turn chat workload (open-loop)
+scripts/           run_local.py (start a cluster), chat.py (terminal client), benchmark.py, chaos.py
 bench/results/     saved benchmark runs
 tests/
 ```

@@ -7,7 +7,8 @@ POST /generate streams SSE events:
 or, on failure, {"type": "error", "message": "..."}.
 
 Every token carries its index so the gateway knows exactly how much of an answer
-the client has received; Phase 3 uses this to resume a stream on another worker.
+the client has received, and can resume the stream on another worker if this one
+dies. A resumed request numbers its tokens from `resume_tokens` onwards.
 """
 
 from contextlib import asynccontextmanager
@@ -32,7 +33,7 @@ def create_app(backend: Backend, worker_id: str) -> FastAPI:
     async def generate(req: GenerateRequest) -> StreamingResponse:
         async def events():
             result = GenerationResult()
-            index = 0
+            index = req.resume_tokens
             try:
                 async for text in backend.generate(req, result):
                     yield sse.encode({"type": "token", "index": index, "text": text})
