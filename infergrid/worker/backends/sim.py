@@ -35,10 +35,15 @@ class SimConfig:
     prefill_ms_per_token: float = 0.4
     decode_ms_per_token: float = 25.0
     max_concurrency: int = 4
+    max_queue: int | None = None  # requests refused once active+waiting reaches this; default max_concurrency * 3
     cache_capacity_blocks: int = 4096
     block_size: int = BLOCK_SIZE
     min_output_tokens: int = 24
     max_output_tokens: int = 160
+
+    def __post_init__(self) -> None:
+        if self.max_queue is None:
+            self.max_queue = self.max_concurrency * 3
 
 
 def reference_answer(messages: Sequence[ChatMessage], max_tokens: int | None,
@@ -62,11 +67,15 @@ class SimBackend(Backend):
 
     def __init__(self, config: SimConfig | None = None):
         self.config = config or SimConfig()
+        self.max_queue = self.config.max_queue
         self.cache = PrefixCache(self.config.cache_capacity_blocks, self.config.block_size)
         self._slots = asyncio.Semaphore(self.config.max_concurrency)
         self._active = 0
         self._queued = 0
         self._requests = 0
+
+    def queue_depth(self) -> int:
+        return self._active + self._queued
 
     async def generate(self, req: GenerateRequest, result: GenerationResult) -> AsyncIterator[str]:
         cfg = self.config

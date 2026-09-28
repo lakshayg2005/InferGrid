@@ -1,6 +1,6 @@
 """Start and stop a cluster of worker and gateway processes on this machine.
 
-Used by scripts/run_local.py and scripts/benchmark.py.
+Used by scripts/run_local.py, scripts/benchmark.py and scripts/chaos.py.
 """
 
 import subprocess
@@ -31,6 +31,9 @@ class LocalCluster:
     router: str = "consistent_hash"
     epsilon: float = 0.25
     max_failovers: int = 2
+    membership: bool = True  # SWIM failure detection (see membership/swim.py)
+    swim_offset: int = 1000  # a member's UDP port is its HTTP port plus this
+    hedge_delay_ms: float | None = None
     gateway_port: int = 8700
     worker_base_port: int = 8701
     quiet: bool = False  # hide process output (benchmarks)
@@ -44,17 +47,27 @@ class LocalCluster:
 
     def start(self) -> None:
         try:
-            for i in range(self.workers):
-                name, port = f"worker-{i + 1}", self.worker_base_port + i
+            worker_ports = [self.worker_base_port + i for i in range(self.workers)]
+            swim_addrs = [f"127.0.0.1:{p + self.swim_offset}" for p in worker_ports]
+
+            for i, port in enumerate(worker_ports):
+                name = f"worker-{i + 1}"
                 url = f"http://127.0.0.1:{port}"
                 self.worker_urls.append(url)
                 cmd = ["-m", "infergrid.worker", "--id", name, "--port", str(port),
                        "--backend", self.backend, "--model", self.model]
+                if self.membership:
+                    seeds = [a for j, a in enumerate(swim_addrs) if j != i]
+                    cmd += ["--swim-port", str(port + self.swim_offset), "--seeds", ",".join(seeds)]
                 self._workers.append(
                     _Process(url, self._spawn(cmd), lambda b, name=name: b.get("worker_id") == name, cmd))
 
             cmd = ["-m", "infergrid.gateway", "--port", str(self.gateway_port), "--workers", ",".join(self.worker_urls),
                    "--router", self.router, "--epsilon", str(self.epsilon), "--max-failovers", str(self.max_failovers)]
+            if self.membership:
+                cmd += ["--swim-port", str(self.gateway_port + self.swim_offset), "--seeds", ",".join(swim_addrs)]
+            if self.hedge_delay_ms:
+                cmd += ["--hedge-delay-ms", str(self.hedge_delay_ms)]
             self._gateway = _Process(self.gateway_url, self._spawn(cmd), lambda b: b.get("workers") == self.worker_urls)
 
             for p in [*self._workers, self._gateway]:

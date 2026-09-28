@@ -5,7 +5,9 @@ import argparse
 import uvicorn
 
 from infergrid.gateway.app import create_app
+from infergrid.gateway.rate_limit import RateLimiter
 from infergrid.gateway.router import ROUTERS, make_router
+from infergrid.membership import SwimNode
 
 
 def main() -> None:
@@ -18,12 +20,34 @@ def main() -> None:
                         help="consistent_hash load bound: 0.25 lets a worker take 25%% above average; inf disables it")
     parser.add_argument("--max-failovers", type=int, default=2,
                         help="how many times one answer may move to another worker mid-stream (0 disables)")
+    parser.add_argument("--swim-port", type=int, default=None,
+                        help="UDP port for SWIM failure detection; omit to route to every configured worker blindly")
+    parser.add_argument("--seeds", default="", help="comma-separated host:swim_port of workers to bootstrap from")
+    parser.add_argument("--rate-limit-capacity", type=float, default=None,
+                        help="per-tenant token bucket size; omit to disable rate limiting")
+    parser.add_argument("--rate-limit-per-second", type=float, default=5.0, help="per-tenant refill rate")
+    parser.add_argument("--hedge-delay-ms", type=float, default=None,
+                        help="also try the next-best worker if no token arrives within this long; omit to disable")
     args = parser.parse_args()
 
     workers = [w.strip() for w in args.workers.split(",") if w.strip()]
     router = make_router(args.router, args.epsilon)
-    print(f"gateway on http://{args.host}:{args.port} -> {len(workers)} workers, router={args.router}")
-    app = create_app(workers, router, max_failovers=args.max_failovers)
+
+    membership = None
+    if args.swim_port:
+        seeds = [s.strip() for s in args.seeds.split(",") if s.strip()]
+        membership = SwimNode(f"{args.host}:{args.swim_port}", seeds=seeds)
+
+    rate_limit = None
+    if args.rate_limit_capacity:
+        rate_limit = RateLimiter(args.rate_limit_capacity, args.rate_limit_per_second)
+
+    print(f"gateway on http://{args.host}:{args.port} -> {len(workers)} workers, router={args.router}"
+          + (f", swim on {args.host}:{args.swim_port}" if membership else "")
+          + (f", rate limit {args.rate_limit_capacity}/{args.rate_limit_per_second}s" if rate_limit else "")
+          + (f", hedge after {args.hedge_delay_ms}ms" if args.hedge_delay_ms else ""))
+    app = create_app(workers, router, max_failovers=args.max_failovers, membership=membership,
+                     rate_limit=rate_limit, hedge_delay_ms=args.hedge_delay_ms)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

@@ -13,7 +13,7 @@ See [DESIGN.md](DESIGN.md) for the architecture and the reasoning behind it.
 |---|---|---|
 | 1 | Gateway + workers (simulated + Ollama), OpenAI-compatible streaming, round-robin routing, failover before first token | ✅ Done |
 | 2 | Cache-aware routing (prefix hashing + bounded-load consistent hashing), benchmarks | ✅ Done |
-| 3 | Mid-stream failover ✅ · gossip membership, load shedding, rate limiting, hedging | In progress |
+| 3 | Mid-stream failover, SWIM failure detection, load shedding, rate limiting, hedged requests | ✅ Done |
 | 4 | Sharded, replicated state store | |
 | 5 | Kafka: batch inference, usage metering | |
 | 6 | Semantic cache, predictive autoscaling | |
@@ -52,10 +52,12 @@ python scripts/run_local.py --workers 2 --backend ollama
 | Service | Endpoint | Purpose |
 |---|---|---|
 | Gateway | `POST /v1/chat/completions` | OpenAI-compatible chat, streaming or not |
-| Gateway | `GET /health` | Router and worker list |
-| Gateway | `GET /stats` | Requests in flight and routed per worker |
-| Worker | `POST /generate` | Internal: stream indexed tokens as SSE |
+| Gateway | `GET /health` | Router, worker list and which workers SWIM currently reports alive |
+| Gateway | `GET /stats` | Requests in flight, routed, failovers, hedges, rate-limit rejections |
+| Gateway | `GET /membership` | This gateway's SWIM view (empty if `--swim-port` not set) |
+| Worker | `POST /generate` | Internal: stream indexed tokens as SSE; 503s if at capacity (load shedding) |
 | Worker | `GET /stats` | Queue depth, prefix-cache hit rate |
+| Worker | `GET /membership` | This worker's SWIM view (empty if `--swim-port` not set) |
 
 Every response carries `X-InferGrid-Worker` (which worker served it) and `X-Request-Id`.
 
@@ -95,31 +97,52 @@ Raw per-request data: [bench/results/](bench/results/). Reproduce with `python s
 ## Chaos test
 
 ```bash
-python scripts/chaos.py                # ~3 minutes
+python scripts/chaos.py                # ~3.5 minutes
 ```
 
-Kills a random worker every 8 seconds under load (and restarts it 3 seconds later
-with an empty cache), once with mid-stream failover off and once on. Every answer
-that completes is checked word for word against the answer the simulator gives
-when nothing fails.
+Kills a random worker every 12 seconds under load and restarts it 8 seconds later
+with an empty cache (a slower recovery than the earlier 3 s default, closer to a
+real process supervisor reloading a model), on the same workload and kill
+schedule three times: with neither mid-stream failover nor SWIM failure
+detection, with failover alone, and with both. Every answer that completes is
+checked word for word against the answer the simulator gives when nothing fails.
 
-### Results (4 workers, 7 workers killed during a 60-second run, same workload and kill schedule)
+### Results (4 workers, 5 kills during a 60-second run, identical workload and kill schedule)
 
 | Run | Requests | Answers lost | Answers corrupted | Mid-stream failovers | TTFT p50 | TTFT p99 |
 |---|---|---|---|---|---|---|
-| failover off | 459 | 21 (4.6%) | 0 | 0 | 78 ms | 2339 ms |
-| **failover on** | 504 | **0** | **0** | 25 | 80 ms | 2448 ms |
+| nothing (baseline) | 465 | 14 (3.0%) | 0 | 0 | 80 ms | 2746 ms |
+| failover only | 504 | 0 (0.0%) | 0 | 17 | 93 ms | 2557 ms |
+| failover + membership | 504 | **0 (0.0%)** | 0 | **8** | 159 ms | 3604 ms |
 
-- Mid-stream failover saved every answer interrupted by a crash, with no change
-  to median latency. ("Requests" differs because a conversation stops at its
-  first lost answer.)
-- **Open problem:** p99 is ~2.4 s in both runs. 37 of the 42 requests slower
-  than 1 s were sent while a worker was down: the gateway still routes new
-  requests to the dead worker and waits for the connection to be refused
-  (about 2 s on Windows) before trying the next one. Failure detection fixes this.
-- Earlier runs with longer answers (~100% cluster utilisation) showed median
-  latency growing several-fold as queues built up while capacity was reduced by
-  crashes. Load shedding is the planned fix.
+**What this shows**
+
+- Mid-stream failover alone already gets answers to 0% lost, by resuming on
+  another worker whenever a crash is noticed. SWIM cuts *how often that noticing
+  has to happen at all*: mid-stream failovers fall from 17 to 8, since routing
+  now avoids a worker once it's known dead, instead of finding out mid-answer.
+- **A real bug found and fixed along the way:** SWIM's first timeouts (150 ms
+  ping, 1 s suspicion) were copied from this project's own fast unit tests,
+  which run many nodes in one lightly-loaded process. Run for real as separate
+  OS processes also serving inference traffic, those timeouts caused false
+  positives — a chaos run showed only 1 of 4 workers still marked alive by the
+  end, with no matching kill in the schedule. `membership/swim.py`'s defaults
+  are now 500 ms / 2 s, with a wider indirect-ping budget; see section 3.4 of
+  [DESIGN.md](DESIGN.md) for the full account.
+- **Open problem, and it connects to the router's:** tail latency with
+  membership is *worse* (3604 ms vs 2557 ms), not better. This cluster has no
+  spare capacity — it's sized for 4 workers' worth of load, not 3 — so
+  correctly routing around a dead worker piles its full share onto the
+  survivors for the length of the outage. "Failover only" coincidentally
+  avoids this: its bounded-load math still divides by the stale count of 4,
+  spreading load thinner even though some of it is wasted on doomed connection
+  attempts to the dead worker. That is the same root cause as Phase 2's open
+  problem — the load bound isn't capacity-aware — so fixing it (weighting the
+  bound by each worker's `max_concurrency` rather than a flat per-worker cap)
+  is the next experiment for both.
+- Nothing here is a reliability regression: 0 answers lost or corrupted with
+  membership on, in every run. It's a latency effect of running at capacity
+  with one fewer worker, not a bug.
 
 ## Tests
 
@@ -132,11 +155,12 @@ pytest
 ```
 infergrid/
   common/          schemas, tokenizer + prefix block hashing, consistent hash ring, SSE
-  worker/          worker API, prefix cache, backends (sim, ollama)
-  gateway/         gateway API, load tracking, routing policies
+  membership/      SWIM failure detection over real UDP sockets
+  worker/          worker API, prefix cache, load shedding, backends (sim, ollama)
+  gateway/         gateway API, routing, mid-stream failover, hedging, rate limiting
   local_cluster.py start/stop worker and gateway processes
   loadgen.py       realistic multi-turn chat workload (open-loop)
 scripts/           run_local.py (start a cluster), chat.py (terminal client), benchmark.py, chaos.py
-bench/results/     saved benchmark runs
-tests/
+bench/results/     saved benchmark and chaos runs
+tests/             tests/test_hedging.py uses real sockets; everything else is fast in-process ASGI
 ```

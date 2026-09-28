@@ -111,3 +111,22 @@ async def test_worker_numbers_resumed_tokens_from_the_resume_point():
         resp = await client.post("/generate", json=req.model_dump())
     events = [json.loads(line[6:]) for line in resp.text.splitlines() if line.startswith("data: ")]
     assert [e["index"] for e in events[:-1]] == [2, 3, 4, 5]
+
+
+async def test_membership_endpoint_empty_when_no_membership_configured():
+    app = create_app(SimBackend(FAST), "w1")
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://w1") as client:
+        resp = await client.get("/membership")
+    assert resp.json() == {}
+
+
+async def test_worker_reports_its_own_membership_snapshot():
+    from infergrid.membership import SwimNode
+    node = SwimNode("127.0.0.1:19501", metadata={"http_url": "http://w1"},
+                    protocol_period=0.05, ping_timeout=0.05, suspicion_timeout=0.2)
+    app = create_app(SimBackend(FAST), "w1", membership=node)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://w1") as client:
+        resp = await client.get("/membership")
+    snapshot = resp.json()
+    assert snapshot["127.0.0.1:19501"]["state"] == "alive"
+    assert snapshot["127.0.0.1:19501"]["metadata"] == {"http_url": "http://w1"}

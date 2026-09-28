@@ -9,28 +9,45 @@ or, on failure, {"type": "error", "message": "..."}.
 Every token carries its index so the gateway knows exactly how much of an answer
 the client has received, and can resume the stream on another worker if this one
 dies. A resumed request numbers its tokens from `resume_tokens` onwards.
+
+If the worker is already at capacity, /generate is refused outright with 503
+before any work starts (load shedding), rather than queued behind everything
+already running: the gateway treats any non-200 response as "try the next
+worker" (see gateway/app.py), so a shed request fails over immediately instead
+of waiting in line.
 """
 
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from infergrid.common import sse
 from infergrid.common.schemas import GenerateRequest, GenerationResult
+from infergrid.membership import SwimNode
 from infergrid.worker.backends import Backend
 
 
-def create_app(backend: Backend, worker_id: str) -> FastAPI:
+def create_app(backend: Backend, worker_id: str, membership: SwimNode | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        if membership:
+            await membership.start()
         yield
+        if membership:
+            await membership.stop()
         await backend.close()
 
     app = FastAPI(title=f"InferGrid worker {worker_id}", lifespan=lifespan)
 
     @app.post("/generate")
-    async def generate(req: GenerateRequest) -> StreamingResponse:
+    async def generate(req: GenerateRequest):
+        if backend.queue_depth() >= backend.max_queue:
+            return JSONResponse(
+                {"error": "overloaded", "worker_id": worker_id, "queue_depth": backend.queue_depth()},
+                status_code=503,
+            )
+
         async def events():
             result = GenerationResult()
             index = req.resume_tokens
@@ -54,5 +71,9 @@ def create_app(backend: Backend, worker_id: str) -> FastAPI:
     @app.get("/stats")
     async def stats() -> dict:
         return {"worker_id": worker_id, **backend.stats()}
+
+    @app.get("/membership")
+    async def membership_view() -> dict:
+        return membership.snapshot() if membership else {}
 
     return app

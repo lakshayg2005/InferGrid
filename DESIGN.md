@@ -40,14 +40,14 @@ Companies serving LLMs pay for expensive compute, and naive load balancing waste
                                   │
                 ┌─────────────────▼─────────────────┐
                 │   Gateway (stateless, N replicas)  │
-                │  auth · rate limit · load shedding │
-                │  semantic cache · router · failover│
+                │  rate limit · SWIM · router         │
+                │  semantic cache · failover · hedging│
                 └──────┬───────────────┬─────────────┘
          interactive   │               │ batch jobs / usage events
                        ▼               ▼
       ┌────────────────────────┐   ┌──────────────────────────┐
       │ Workers (LLM + KV cache)│◄──│ Kafka (Redpanda)          │
-      │ gossip membership+load  │   │ topics partitioned by     │
+      │ SWIM · load shedding     │   │ topics partitioned by     │
       └────────────────────────┘   │ tenant; consumer groups   │
                        │           └──────────────────────────┘
                        ▼
@@ -79,10 +79,12 @@ OpenAI SDK works against it unchanged.
   caches its history. Hashing the whole prompt would scatter turns (it changes
   every turn); hashing only the system prompt would send an entire app's traffic
   to one worker.
-- **Load view.** In Phase 2 each gateway counts the requests it has in flight on
-  each worker, reserving a slot *before* connecting so a burst of simultaneous
-  requests cannot all pick the same idle-looking worker. With several gateways
-  each sees only its own share; Phase 3 switches to load reported by workers.
+- **Load view.** Each gateway counts the requests it has in flight on each
+  worker, reserving a slot *before* connecting so a burst of simultaneous
+  requests cannot all pick the same idle-looking worker. With several
+  gateways each sees only its own share, not a cluster-wide total — Phase 3
+  adds SWIM (section 3.4) for *liveness*, but load itself still is not
+  gossiped between gateways; that remains a known gap for a future phase.
 - Baselines for comparison: round-robin (ignores load and cache) and least-loaded
   (perfect balance, ignores cache).
 
@@ -100,8 +102,64 @@ Every streamed token carries its **index**. That is what makes failover possible
 the gateway knows exactly how much of the answer the user has already received.
 
 ### 3.4 Membership and failure detection
-SWIM-style gossip (ping, indirect ping-req, suspicion) so workers and gateways
-learn about joins and failures without a central registry.
+Every worker and the gateway run **SWIM** (Das, Gupta and Motivala, 2002;
+`membership/swim.py`), a real implementation over UDP, not a simulation of one:
+
+- Every protocol period (default 500 ms), a member pings one random peer and
+  waits for an ack. A missed ping is **not** taken as a crash straight away: a
+  few other members are asked to ping the same target on the prober's behalf
+  (an indirect ping), since the direct link between just those two members
+  might be the only thing broken.
+- Only if that also gets no reply is the member marked **suspect**, and only
+  **dead** if it does not refute the suspicion (by gossiping a higher
+  incarnation number for itself, proving it is still running) within the
+  suspicion timeout (default 2 s). Worst case, a real crash takes a few
+  seconds to become DEAD; a healthy member routinely refutes far sooner.
+
+  **This margin was tuned up from an initial, tighter version the hard way.**
+  A first pass used the textbook-scale timeouts from this project's own unit
+  tests (150 ms ping timeout, 1 s suspicion) — those tests run many SWIM nodes
+  in one lightly-loaded process, where that is plenty of margin. Run for real
+  as separate OS processes competing for CPU while also serving inference
+  traffic, those timeouts produced false positives: healthy workers missed a
+  ping under ordinary scheduling jitter and got marked dead, and
+  `scripts/chaos.py` caught it immediately (`alive_workers` dropped to 1 of 4
+  by the end of a run, with no matching kill in the schedule). The fix was
+  more realistic timeouts for a real (not unit-tested) environment, plus
+  more slack on the indirect-ping budget, which has two hops of network delay
+  in addition to the helper's own ping.
+- Membership changes piggyback on ping/ack messages already being sent
+  (infection-style gossip), so the whole group learns about joins and deaths
+  without a central registry and without a separate gossip round.
+- Each member advertises metadata (its HTTP URL); the gateway reads
+  `alive_http_urls()` from its own SWIM view and only routes to workers it
+  currently believes are alive, filtering them out of `router.candidates()`
+  before ever attempting a connection.
+
+**Why this matters over just retrying on failure:** without it, every request
+routed to an already-dead worker pays a full connect/HTTP-refused round trip
+before the gateway's existing failover even gets a chance to try someone else.
+`scripts/chaos.py`'s three-way comparison (nothing / failover only / failover +
+membership) confirms the mechanism works as designed: mid-stream failovers
+(a request that starts on a worker and has to be resumed elsewhere mid-answer)
+fall by more than half once membership routes around a worker known to be
+dead, rather than finding out partway through an answer.
+
+**What it does not fix, and why that's an interesting result, not a bug:**
+in the same chaos runs, *tail latency* with membership on is worse than with
+failover alone. This 4-worker cluster is sized for 4 workers' worth of load;
+correctly excluding a dead one piles its full share onto the 3 survivors for
+the length of the outage, and they queue. "Failover only" coincidentally
+avoids this, since its bounded-load router still divides by the stale count
+of 4, spreading load thinner even though part of it is wasted on doomed
+connection attempts to the dead worker. That is the same root cause as
+section 3.2's open problem (the load bound isn't capacity-aware) wearing a
+different hat: see section 5 for the numbers and the shared fix.
+
+**A limitation, honestly:** membership only tracks the workers this gateway
+was configured with; it does not (yet) drop or add HTTP routing candidates for
+members it discovers that were not in the static `--workers` list, so it is a
+liveness filter today, not a discovery mechanism.
 
 ### 3.5 State store (replication + sharding)
 A Dynamo-style leaderless key-value store, written from scratch:
@@ -131,7 +189,49 @@ make every write wait for one leader and stop writes in a minority partition.
   consumer applies them idempotently (keyed by request ID), so redelivery never
   double-charges a tenant.
 
-### 3.7 AI features (pre-trained only, no training)
+### 3.7 Load shedding and rate limiting (`gateway/rate_limit.py`, `worker/app.py`)
+
+- **Load shedding (worker-side admission control).** Each backend tracks
+  `queue_depth()` (active + waiting requests). `POST /generate` checks this
+  *before* starting any work and returns 503 immediately once it reaches
+  `max_queue`, instead of adding the request to an ever-growing queue behind
+  work that is already running. This needs no new gateway logic: the gateway
+  already treats any non-200 response as "try the next candidate"
+  (`open_worker_stream`), so a shed request fails over to a less busy worker
+  for free, and a cluster where every worker sheds surfaces as one fast 503
+  to the client rather than a slow queue-up.
+- **Rate limiting (gateway-side, per tenant).** A token bucket per tenant
+  (`X-Tenant-Id` header, default `"default"`) refuses a request with 429 and a
+  `Retry-After` header once its burst is spent, protecting every other tenant
+  sharing the cluster from one tenant's spike. Buckets are in-memory per
+  gateway process; with several gateway replicas each enforces its own share
+  of the limit rather than one exact cluster-wide number — an exact limit
+  needs a store every replica shares (e.g. Redis), the same
+  build-it-yourself-vs-Redis trade-off as section 3.5's state store.
+
+### 3.8 Hedged requests (`gateway/app.py::open_hedged_events`)
+
+Targets a different failure mode than mid-stream failover: a worker that is
+merely **slow**, not dead (GC-style pause, a burst of decode-heavy neighbours,
+a stuck request) — the kind of tail latency admission control alone cannot
+fix, since the worker never actually refuses the request.
+
+- The request starts on the router's top candidate as usual. If no token has
+  arrived within `hedge_delay_ms`, the gateway *also* starts the request on
+  the next candidate and continues with whichever produces a token first,
+  discarding the other (closing its connection and releasing its load slot).
+- Only the first attempt is hedged; a failure after that is handled by the
+  existing mid-stream failover, not a fresh hedge, to keep worst-case worker
+  load bounded to 2× a request rather than growing with every retry.
+- **A real testing wrinkle worth recording:** httpx's in-process `ASGITransport`
+  (used for most of this project's tests, since it needs no real sockets) runs
+  a mounted app to completion and buffers the whole response before handing
+  anything back — so it cannot show one worker's headers arriving before
+  another's body finishes, and cannot exercise hedge timing at all.
+  `tests/test_hedging.py` binds real loopback TCP ports with `uvicorn.Server`
+  instead, so the race is genuine.
+
+### 3.9 AI features (pre-trained only, no training)
 - **Semantic cache**: prompts are embedded with a small pre-trained model
   (`all-minilm` via Ollama). A new prompt within a cosine-similarity threshold of
   a cached one is answered from the cache, which lives in the state store,
@@ -156,9 +256,11 @@ offset committed → client polls `GET /v1/batches/{id}`.
 |---|---|
 | Worker crashes before first token | Gateway retries on next worker on the ring |
 | Worker crashes mid-stream | Gateway resumes on another worker from the last received token |
-| Worker slow | Hedged request to a second worker after p95 latency |
+| Worker dead (SWIM-detected) | Excluded from routing candidates before a connection is even attempted |
+| Worker slow but not dead | Hedged request to the next candidate after `hedge_delay_ms` with no token |
+| Worker at capacity | Sheds the request (503) before queueing it; gateway retries the next candidate |
+| Tenant over its rate limit | 429 with `Retry-After`, before any worker is contacted |
 | Storage node down | Sloppy quorum + hinted handoff; read repair on recovery |
-| Cluster overloaded | Admission control sheds lowest-priority work first (batch before interactive) |
 | Kafka consumer crashes | Uncommitted offsets redelivered; idempotent processing prevents duplicates |
 
 **Mid-stream failover in detail.** The gateway remembers every token it has

@@ -13,15 +13,20 @@ from infergrid.worker.backends.base import Backend, BackendError
 class OllamaBackend(Backend):
     name = "ollama"
 
-    def __init__(self, model: str, base_url: str = "http://127.0.0.1:11434", max_concurrency: int = 2):
+    def __init__(self, model: str, base_url: str = "http://127.0.0.1:11434", max_concurrency: int = 2,
+                max_queue: int | None = None):
         self.model = model
         self.max_concurrency = max_concurrency
+        self.max_queue = max_queue if max_queue is not None else max_concurrency * 3
         # Loading a model into memory can take a while on CPU, hence the long read timeout.
         self._client = httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(10.0, read=300.0))
         self._slots = asyncio.Semaphore(max_concurrency)
         self._active = 0
         self._queued = 0
         self._requests = 0
+
+    def queue_depth(self) -> int:
+        return self._active + self._queued
 
     async def generate(self, req: GenerateRequest, result: GenerationResult) -> AsyncIterator[str]:
         messages = [m.model_dump() for m in req.messages]

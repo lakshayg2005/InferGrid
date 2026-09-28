@@ -1,12 +1,13 @@
 """Chaos test: kill workers under load and check that no answer is lost or corrupted.
 
-    python scripts/chaos.py                    # with and without failover, ~3 minutes
-    python scripts/chaos.py --kill-every 5     # harsher
+    python scripts/chaos.py                    # ~3.5 minutes
+    python scripts/chaos.py --kill-every 6 --downtime 4     # harsher, more overlapping failures
 
 While the chat workload runs, a random worker is killed abruptly (like a machine
 losing power) every few seconds and restarted, with an empty cache, a few seconds
-later. The same workload and the same kill schedule run twice: once with mid-stream
-failover disabled and once enabled.
+later. The same workload and the same kill schedule run three times: with neither
+mid-stream failover nor SWIM failure detection, with failover alone, and with both
+-- so each mechanism's contribution shows up in the numbers on its own.
 
 Every completed answer is compared word for word with the answer the simulator
 gives when nothing fails, so "survived" means complete and correct, not just
@@ -67,8 +68,8 @@ def main() -> None:
     parser.add_argument("--duration", type=float, default=60.0)
     parser.add_argument("--rate", type=float, default=1.5, help="new conversations per second")
     parser.add_argument("--max-tokens", type=int, default=40)
-    parser.add_argument("--kill-every", type=float, default=8.0, help="seconds between kills")
-    parser.add_argument("--downtime", type=float, default=3.0, help="seconds before a killed worker restarts")
+    parser.add_argument("--kill-every", type=float, default=12.0, help="seconds between kills")
+    parser.add_argument("--downtime", type=float, default=8.0, help="seconds before a killed worker restarts")
     parser.add_argument("--seed", type=int, default=11)
     parser.add_argument("--base-port", type=int, default=8800)
     args = parser.parse_args()
@@ -77,13 +78,17 @@ def main() -> None:
     kill_times = [args.kill_every * k for k in range(1, int(args.duration / args.kill_every) + 1)]
     schedule = [(t, rng.randrange(args.workers)) for t in kill_times]
 
+    configs = [
+        ("nothing (baseline)", 0, False),
+        ("failover only", 2, False),
+        ("failover + membership", 2, True),
+    ]
     rows, raw = [], []
-    for i, max_failovers in enumerate([0, 2]):
-        label = "failover off" if max_failovers == 0 else "failover on"
+    for i, (label, max_failovers, membership) in enumerate(configs):
         port = args.base_port + 20 * i
         print(f"running with {label} ...", flush=True)
         with LocalCluster(workers=args.workers, router="consistent_hash", max_failovers=max_failovers,
-                          gateway_port=port, worker_base_port=port + 1, quiet=True) as cluster:
+                          membership=membership, gateway_port=port, worker_base_port=port + 1, quiet=True) as cluster:
             records, wrong, log, stats = asyncio.run(run(cluster, args, schedule))
         failed = [r for r in records if not r.ok]
         ttft = [r.ttft * 1000 for r in records if r.ok]
@@ -91,7 +96,8 @@ def main() -> None:
                      percentile(ttft, 99)))
         print(f"  {len(log)} workers killed; {len(failed)} of {len(records)} answers lost, "
               f"{len(wrong)} corrupted, {stats['failovers']} mid-stream failovers; "
-              f"in flight after the run: {sum(stats['in_flight'].values())}")
+              f"in flight after the run: {sum(stats['in_flight'].values())}; "
+              f"alive at end: {len(stats['alive_workers'])}/{args.workers}")
         raw.append({"run": label, "kills": log, "gateway_stats": stats, "records": [asdict(r) for r in records]})
         for r in failed[:3]:
             print(f"    e.g. conversation {r.conversation} turn {r.turn}: {r.error[:100]}")
