@@ -1,0 +1,24 @@
+# Optional: a real Kafka-API broker for infergrid.queue.redpanda.RedpandaClient,
+# in place of infergrid.queue.broker (the from-scratch one everything else here
+# uses and is tested against). Not required for anything else in this repo.
+#
+#   docker compose up -d
+#   python -m infergrid.gateway --workers ... --broker redpanda --bootstrap-servers 127.0.0.1:9092 --store-url ...
+#
+# See infergrid/queue/redpanda.py's module docstring: this compose file and
+# backend are not exercised by this project's tests in this environment (no
+# Docker was available while writing them) -- validate before trusting it.
+services:
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --node-id=0
+      - --kafka-addr=PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://127.0.0.1:9092
+    ports:
+      - "9092:9092"

@@ -46,9 +46,10 @@ Companies serving LLMs pay for expensive compute, and naive load balancing waste
          interactive   │               │ batch jobs / usage events
                        ▼               ▼
       ┌────────────────────────┐   ┌──────────────────────────┐
-      │ Workers (LLM + KV cache)│◄──│ Kafka (Redpanda)          │
-      │ SWIM · load shedding     │   │ topics partitioned by     │
-      └────────────────────────┘   │ tenant; consumer groups   │
+      │ Workers (LLM + KV cache)│◄──│ Queue broker (from scratch│
+      │ SWIM · load shedding     │   │ + a real-Kafka option)    │
+      └────────────────────────┘   │ topics partitioned by     │
+                       │           │ tenant; consumer groups   │
                        │           └──────────────────────────┘
                        ▼
       ┌────────────────────────────────────────────┐
@@ -296,15 +297,74 @@ real, reproducible limitation of a failure detector sharing an event loop with
 the workload it is trying to stay responsive under, worth its own investigation
 rather than a guessed fix.
 
-### 3.6 Messaging (Kafka via Redpanda)
-- **Batch inference API** (`POST /v1/batches`): jobs go to a topic partitioned by
-  tenant. Workers consume only while their interactive queue is short, so batch
-  work fills idle capacity without hurting live users. Delivery is at-least-once;
-  processing is idempotent (results keyed by job ID), failures retry with
-  exponential backoff and jitter, and poison messages go to a dead-letter topic.
-- **Usage metering**: every completed request emits a usage event. A billing
-  consumer applies them idempotently (keyed by request ID), so redelivery never
-  double-charges a tenant.
+### 3.6 Messaging (`infergrid/queue/`, `infergrid/billing/`)
+
+A from-scratch, Kafka-compatible message broker (`infergrid/queue/broker/`),
+written for the same reason SWIM and the state store were: to demonstrate the
+real mechanics -- topic partitioning, consumer groups, at-least-once delivery,
+rebalancing on a crash -- rather than only knowing how to point a client
+library at somebody else's server. `infergrid/queue/base.py::QueueClient` is
+the interface application code (the gateway's batch endpoints, a worker's
+batch consumer, the billing consumer) is written against; two implementations
+exist behind it:
+
+| Implementation | What it is | Tested here? |
+|---|---|---|
+| `infergrid.queue.client.BrokerClient` | HTTP client for `infergrid/queue/broker/` | Yes -- `tests/test_queue_broker.py` (the broker's core logic directly), `tests/test_queue_http.py` (real request/response cycles + the retry/DLQ consumer loop), `tests/test_batch.py` (the full pipeline), `scripts/batch_demo.py` (real multi-process) |
+| `infergrid.queue.redpanda.RedpandaClient` | `aiokafka` client for a real Kafka-API broker (Redpanda, via `docker-compose.yml`) | **No.** Written but unverified -- no Docker in this project's environment. See that module's docstring. |
+
+**Broker semantics** (`broker/core.py`): a topic has a fixed number of
+partitions; a key hashes to one (same ring-hash helper the router uses), so
+one tenant's jobs stay ordered on one partition while different tenants
+spread across partitions and process in parallel. A consumer group's
+partitions are round-robin assigned across its current members and
+rebalanced whenever one goes quiet for `session_timeout` -- the mechanism
+that lets another consumer pick up a message the crashed one had polled but
+never committed, which is what makes delivery at-least-once rather than
+at-most-once. Deliberate simplification: at most one *in-flight* (delivered,
+uncommitted) message per partition at a time, not Kafka's pipelined fetch --
+trivial to reason about and test, at the cost of some throughput; different
+partitions still process concurrently.
+
+**Retry, backoff and the dead-letter topic are consumer-side policy**
+(`queue/consumer.py::consume_with_retry`), not a broker feature -- real Kafka
+doesn't have one built in either. A handler that raises gets its message
+committed immediately (freeing the partition) and republished with
+`attempt + 1` after an exponential-backoff-plus-jitter delay; once `attempt`
+reaches `max_attempts`, the message goes to `f"{topic}.dlq"` instead of
+retrying forever and blocking everything behind it. This one function is used
+identically by the worker's batch consumer and the billing consumer,
+regardless of which `QueueClient` backs them.
+
+**Batch inference** (`POST /v1/batches` in `gateway/app.py`): each request in
+the batch becomes one job message on the `"batch-jobs"` topic, keyed by
+tenant, and the gateway returns immediately with a `batch_id` and one
+`job_id` per job. A worker's background consumer (`worker/app.py`) only pulls
+a job while `backend.queue_depth()` is below `idle_queue_depth`, so batch
+work fills idle capacity instead of competing with interactive requests for
+it. A result is written to the Phase 4 state store keyed by `job_id` --
+reusing the store here, rather than adding a second durability mechanism, is
+deliberate: `GET /v1/batches/{batch_id}` reads each job's result straight
+from it. Idempotency is a store lookup before doing any real work: if
+`job_id`'s result already exists, a redelivered duplicate is a no-op, not
+repeated generation. `tests/test_batch.py` proves this directly (a
+`CountingBackend` that publishing the same job twice still only calls
+`generate()` once) and `scripts/batch_demo.py` proves it under a real worker
+crash: jobs a killed worker had claimed but not finished still complete,
+processed by the survivor once the broker's session timeout reassigns them.
+
+**Usage metering**: the gateway publishes a `"usage"` event on every
+completed interactive request (`gateway/app.py::meter_usage`, fire-and-forget
+so a slow broker never adds response latency) and a worker publishes one per
+completed batch job. `infergrid/billing/consumer.py::apply_usage_event`
+folds each event into a per-tenant running total in the store, keyed by
+`request_id`: a redelivered duplicate finds its dedup marker already there
+and is skipped, so at-least-once delivery never double-charges a tenant. This
+is a plain read-modify-write against the store, not an atomic increment --
+correct for one billing consumer instance, but two instances processing the
+same tenant concurrently could race on the total. A real billing pipeline
+would use a CRDT counter or a transactional store here; out of scope, in the
+same spirit as section 3.5's unimplemented Merkle-tree anti-entropy.
 
 ### 3.7 Load shedding and rate limiting (`gateway/rate_limit.py`, `worker/app.py`)
 
@@ -363,9 +423,11 @@ router picks worker → stream tokens to client → on worker failure, resume on
 another worker from the last token index → store conversation turn → emit usage
 event.
 
-**Batch job:** client → gateway → job record written to state store → message
-published to Kafka → idle worker consumes → result written to state store →
-offset committed → client polls `GET /v1/batches/{id}`.
+**Batch job:** client → gateway → one job message per request published to the
+queue, keyed by tenant → job-ID list written to the state store under the
+batch ID → idle worker consumes a job, checks the store for an existing
+result (idempotency) → generates → result written to the store → usage event
+published → offset committed → client polls `GET /v1/batches/{id}`.
 
 ## 5. Failure handling
 
@@ -378,7 +440,8 @@ offset committed → client polls `GET /v1/batches/{id}`.
 | Worker at capacity | Sheds the request (503) before queueing it; gateway retries the next candidate |
 | Tenant over its rate limit | 429 with `Retry-After`, before any worker is contacted |
 | Storage node down | Sloppy quorum + hinted handoff; read repair on recovery |
-| Kafka consumer crashes | Uncommitted offsets redelivered; idempotent processing prevents duplicates |
+| Worker crashes mid-batch-job | Uncommitted job redelivered to another worker once its session times out; idempotent (store lookup) so no duplicate work |
+| A batch job keeps failing | Retried with backoff up to `max_attempts`, then sent to `{topic}.dlq` instead of blocking the partition forever |
 
 **Mid-stream failover in detail.** The gateway remembers every token it has
 forwarded. When a worker's stream breaks (connection reset, error event, or the
@@ -399,7 +462,7 @@ answer produced without failures.
 | 2 | Prefix block hashing, bounded-load consistent hashing, load generator, benchmark vs round-robin |
 | 3 | SWIM membership, mid-stream failover, hedged requests, load shedding, rate limiting |
 | 4 | Sharded, replicated state store (quorums, hinted handoff, read repair) |
-| 5 | Kafka: batch inference API, usage metering, retries, dead-letter topic |
+| 5 | Message queue (from scratch, + an unverified real-Kafka option): batch inference API, usage metering, retries, dead-letter topic |
 | 6 | Semantic cache, predictive autoscaling |
 | 7 | Docker, Kubernetes, Prometheus/Grafana, OpenTelemetry, chaos tests, demo UI |
 

@@ -38,16 +38,46 @@ class LocalCluster:
     gateway_port: int = 8700
     worker_base_port: int = 8701
     quiet: bool = False  # hide process output (benchmarks)
+    queue: bool = False  # also run a broker + a single-node store + billing consumer (Phase 5)
+    queue_port: int = 8900
+    store_port: int = 8950
     worker_urls: list[str] = field(default_factory=list, init=False)
     _workers: list[_Process] = field(default_factory=list, init=False)
     _gateway: _Process | None = field(default=None, init=False)
+    _broker: _Process | None = field(default=None, init=False)
+    _store: _Process | None = field(default=None, init=False)
+    _billing: _Process | None = field(default=None, init=False)
 
     @property
     def gateway_url(self) -> str:
         return f"http://127.0.0.1:{self.gateway_port}"
 
+    @property
+    def queue_url(self) -> str:
+        return f"http://127.0.0.1:{self.queue_port}"
+
+    @property
+    def store_url(self) -> str:
+        return f"http://127.0.0.1:{self.store_port}"
+
     def start(self) -> None:
         try:
+            queue_args = []
+            if self.queue:
+                self._broker = _Process(self.queue_url, self._spawn(["-m", "infergrid.queue.broker",
+                                        "--port", str(self.queue_port)]), lambda b: b.get("status") == "ok")
+                store_cmd = ["-m", "infergrid.store", "--port", str(self.store_port), "--nodes", self.store_url,
+                            "--n-replicas", "1", "--w", "1", "--r", "1"]
+                self._store = _Process(self.store_url, self._spawn(store_cmd),
+                                       lambda b: b.get("addr") == self.store_url, store_cmd)
+                for p in (self._broker, self._store):
+                    if not _wait_until_healthy(p):
+                        raise RuntimeError(f"{p.url} did not start (is the port already in use?)")
+                queue_args = ["--queue-url", self.queue_url, "--store-url", self.store_url]
+
+                billing_cmd = ["-m", "infergrid.billing", "--queue-url", self.queue_url, "--store-url", self.store_url]
+                self._billing = _Process(self.queue_url, self._spawn(billing_cmd), lambda b: True, billing_cmd)
+
             worker_ports = [self.worker_base_port + i for i in range(self.workers)]
             swim_addrs = [f"127.0.0.1:{p + self.swim_offset}" for p in worker_ports]
 
@@ -56,7 +86,7 @@ class LocalCluster:
                 url = f"http://127.0.0.1:{port}"
                 self.worker_urls.append(url)
                 cmd = ["-m", "infergrid.worker", "--id", name, "--port", str(port),
-                       "--backend", self.backend, "--model", self.model]
+                       "--backend", self.backend, "--model", self.model, *queue_args]
                 if self.membership:
                     seeds = [a for j, a in enumerate(swim_addrs) if j != i]
                     cmd += ["--swim-port", str(port + self.swim_offset), "--seeds", ",".join(seeds)]
@@ -64,7 +94,8 @@ class LocalCluster:
                     _Process(url, self._spawn(cmd), lambda b, name=name: b.get("worker_id") == name, cmd))
 
             cmd = ["-m", "infergrid.gateway", "--port", str(self.gateway_port), "--workers", ",".join(self.worker_urls),
-                   "--router", self.router, "--epsilon", str(self.epsilon), "--max-failovers", str(self.max_failovers)]
+                   "--router", self.router, "--epsilon", str(self.epsilon), "--max-failovers", str(self.max_failovers),
+                   *queue_args]
             if self.membership:
                 cmd += ["--swim-port", str(self.gateway_port + self.swim_offset), "--seeds", ",".join(swim_addrs)]
             if self.hedge_delay_ms:
@@ -79,7 +110,9 @@ class LocalCluster:
             raise
 
     def stop(self) -> None:
-        procs = [p.proc for p in self._workers] + ([self._gateway.proc] if self._gateway else [])
+        procs = [p.proc for p in self._workers] + [
+            p.proc for p in (self._gateway, self._billing, self._broker, self._store) if p is not None
+        ]
         for proc in procs:
             proc.terminate()
         for proc in procs:

@@ -2,8 +2,8 @@
 
 A distributed LLM serving platform. A gateway sits in front of many LLM workers and
 makes them behave like one fast, cheap and fault-tolerant AI service: cache-aware
-routing, a sharded and replicated state store, Kafka-based batch inference, and
-streams that survive worker crashes.
+routing, a sharded and replicated state store, a Kafka-compatible message queue for
+batch inference, and streams that survive worker crashes.
 
 See [DESIGN.md](DESIGN.md) for the architecture and the reasoning behind it.
 
@@ -15,7 +15,7 @@ See [DESIGN.md](DESIGN.md) for the architecture and the reasoning behind it.
 | 2 | Cache-aware routing (prefix hashing + bounded-load consistent hashing), benchmarks | ✅ Done |
 | 3 | Mid-stream failover, SWIM failure detection, load shedding, rate limiting, hedged requests | ✅ Done |
 | 4 | Sharded, replicated state store | ✅ Done |
-| 5 | Kafka: batch inference, usage metering | |
+| 5 | Batch inference, usage metering, message queue | ✅ Done |
 | 6 | Semantic cache, predictive autoscaling | |
 | 7 | Kubernetes, observability, chaos tests, demo UI | |
 
@@ -60,6 +60,9 @@ python scripts/run_local.py --workers 2 --backend ollama
 | Worker | `GET /membership` | This worker's SWIM view (empty if `--swim-port` not set) |
 | Store | `GET/PUT/DELETE /kv/{key}` | Client-facing coordinator API: any node accepts any key |
 | Store | `GET /stats` | Key count, hints currently held for down peers, this node's alive-node view |
+| Gateway | `POST /v1/batches` | Submit many independent jobs at once; returns a `batch_id` immediately |
+| Gateway | `GET /v1/batches/{batch_id}` | Per-job status and results, read from the state store |
+| Broker | `POST /topics/{topic}/{publish,poll,commit,leave}` | Internal: producer/consumer-group API, see `infergrid/queue/broker/app.py` |
 
 Every response carries `X-InferGrid-Worker` (which worker served it) and `X-Request-Id`.
 
@@ -189,6 +192,53 @@ unresolved third finding: an occasional, non-self-healing membership partition
 under sustained load with more than 4 nodes on a modest dev machine, recorded
 as a `FAIL` with a write-failure count rather than papered over.
 
+## Batch inference & messaging
+
+```bash
+python scripts/batch_demo.py                  # ~40 seconds, real gateway + broker + store + 2 workers + billing consumer
+```
+
+A from-scratch, Kafka-compatible message broker (`infergrid/queue/broker/`):
+topic partitioning, consumer groups that share a topic's partitions and
+rebalance when a member crashes, and at-least-once delivery. On top of it:
+`POST /v1/batches` queues independent jobs a worker only picks up while its
+interactive queue is short (idle capacity, not competing with live chats);
+results land in the Phase 4 state store, keyed by job ID, so redelivering the
+same job is a no-op rather than repeated work; a job that keeps failing goes
+to a dead-letter topic instead of blocking everything behind it; every
+completed request -- interactive or batch -- emits a usage event a billing
+consumer folds into a per-tenant total exactly once, keyed by request ID.
+
+`tests/test_queue_broker.py` and `tests/test_queue_http.py` cover the broker
+and the retry/dead-letter logic directly; `tests/test_batch.py` runs the full
+pipeline in-process, including an idempotency check (publishing the same job
+twice only generates once) and a poison-job-reaches-the-DLQ check.
+`scripts/batch_demo.py` is the real multi-process version: it submits several
+small batches spread across tenants, kills one of two worker processes
+mid-batch, and confirms every job still completes -- some of them via
+at-least-once redelivery to the survivor once the broker's session timeout
+reassigns them -- with correct results and a non-zero billed total for both
+the interactive and batch tenants. A recent run:
+
+```
+submitted 4 batches, 12 jobs total, across tenants ['acme-0', 'acme-1', 'acme-2', 'acme-3']
+killing worker-1 mid-batch (no graceful shutdown) ...
+12/12 jobs done after up to 45.0s (worker-1's stuck work needed the broker's 10s session timeout to be reassigned)
+12/12 batch results correct
+billed usage: interactive=16 tokens, batch=360 tokens across 4 tenants
+
+PASS
+```
+
+**Also implemented, but not verified in this environment:**
+`infergrid/queue/redpanda.py` is the same `QueueClient` interface backed by a
+real Kafka-API broker (Redpanda, via `docker-compose.yml`) using `aiokafka`
+(`pip install -e ".[kafka]"`, then `--broker redpanda --bootstrap-servers
+127.0.0.1:9092` on the gateway/worker/billing CLIs) -- there was no Docker in
+this project's development environment, so unlike everything else in this
+README, this path has no test or demo run behind it. See that module's
+docstring before trusting it.
+
 ## Tests
 
 ```bash
@@ -204,11 +254,15 @@ infergrid/
   worker/          worker API, prefix cache, load shedding, backends (sim, ollama)
   gateway/         gateway API, routing, mid-stream failover, hedging, rate limiting
   store/           Dynamo-style replicated key-value store: quorums, hinted handoff, read repair
-  local_cluster.py start/stop worker, gateway and store-node processes
+  queue/           from-scratch Kafka-compatible broker (broker/), HTTP client, retry/DLQ consumer,
+                   an unverified real-Kafka client (redpanda.py)
+  billing/         idempotent usage-to-billing consumer
+  local_cluster.py start/stop worker, gateway, store-node, broker and billing processes
   loadgen.py       realistic multi-turn chat workload (open-loop)
 scripts/           run_local.py (start a cluster), chat.py (terminal client), benchmark.py,
-                   chaos.py, store_chaos.py
+                   chaos.py, store_chaos.py, batch_demo.py
 bench/results/     saved benchmark and chaos runs
 tests/             tests/test_hedging.py and tests/test_store_http.py use real sockets;
                    everything else is fast in-process ASGI
+docker-compose.yml optional Redpanda broker, for infergrid/queue/redpanda.py
 ```

@@ -2,9 +2,12 @@
 
 import argparse
 
+import httpx
 import uvicorn
 
 from infergrid.membership import SwimNode
+from infergrid.queue.cli import add_broker_args, build_queue_client
+from infergrid.store.client import StoreClient
 from infergrid.worker.app import create_app
 from infergrid.worker.backends import Backend, OllamaBackend, SimBackend, SimConfig
 
@@ -23,6 +26,10 @@ def main() -> None:
     parser.add_argument("--swim-port", type=int, default=None,
                         help="UDP port for SWIM failure detection; omit to disable membership")
     parser.add_argument("--seeds", default="", help="comma-separated host:swim_port of other members to bootstrap from")
+    add_broker_args(parser)
+    parser.add_argument("--store-url", default=None, help="a state store node's base URL; omit to disable batch consumption")
+    parser.add_argument("--idle-queue-depth", type=int, default=1,
+                        help="only pull a batch job while backend.queue_depth() is below this")
     args = parser.parse_args()
 
     backend: Backend
@@ -43,9 +50,18 @@ def main() -> None:
                               metadata={"http_url": f"http://{args.host}:{args.port}",
                                         "capacity": backend.max_concurrency})
 
+    queue_client = store_client = None
+    if args.store_url and (args.queue_url or args.broker == "redpanda"):
+        queue_store_client = httpx.AsyncClient()
+        queue_client = build_queue_client(args, queue_store_client)
+        store_client = StoreClient(queue_store_client, args.store_url)
+
     print(f"{args.id}: {args.backend} backend on http://{args.host}:{args.port}"
-          + (f", swim on {args.host}:{args.swim_port}" if membership else ""))
-    uvicorn.run(create_app(backend, args.id, membership), host=args.host, port=args.port, log_level="warning")
+          + (f", swim on {args.host}:{args.swim_port}" if membership else "")
+          + (f", batch jobs from {args.broker} broker" if queue_client else ""))
+    app = create_app(backend, args.id, membership, queue_client=queue_client, store_client=store_client,
+                     idle_queue_depth=args.idle_queue_depth)
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

@@ -2,12 +2,15 @@
 
 import argparse
 
+import httpx
 import uvicorn
 
 from infergrid.gateway.app import create_app
 from infergrid.gateway.rate_limit import RateLimiter
 from infergrid.gateway.router import ROUTERS, make_router
 from infergrid.membership import SwimNode
+from infergrid.queue.cli import add_broker_args, build_queue_client
+from infergrid.store.client import StoreClient
 
 
 def main() -> None:
@@ -28,6 +31,8 @@ def main() -> None:
     parser.add_argument("--rate-limit-per-second", type=float, default=5.0, help="per-tenant refill rate")
     parser.add_argument("--hedge-delay-ms", type=float, default=None,
                         help="also try the next-best worker if no token arrives within this long; omit to disable")
+    add_broker_args(parser)
+    parser.add_argument("--store-url", default=None, help="a state store node's base URL; omit to disable /v1/batches")
     args = parser.parse_args()
 
     workers = [w.strip() for w in args.workers.split(",") if w.strip()]
@@ -42,12 +47,20 @@ def main() -> None:
     if args.rate_limit_capacity:
         rate_limit = RateLimiter(args.rate_limit_capacity, args.rate_limit_per_second)
 
+    queue_client = store_client = None
+    if args.store_url and (args.queue_url or args.broker == "redpanda"):
+        queue_store_client = httpx.AsyncClient()
+        queue_client = build_queue_client(args, queue_store_client)
+        store_client = StoreClient(queue_store_client, args.store_url)
+
     print(f"gateway on http://{args.host}:{args.port} -> {len(workers)} workers, router={args.router}"
           + (f", swim on {args.host}:{args.swim_port}" if membership else "")
           + (f", rate limit {args.rate_limit_capacity}/{args.rate_limit_per_second}s" if rate_limit else "")
-          + (f", hedge after {args.hedge_delay_ms}ms" if args.hedge_delay_ms else ""))
+          + (f", hedge after {args.hedge_delay_ms}ms" if args.hedge_delay_ms else "")
+          + (f", batches via {args.broker} broker" if queue_client else ""))
     app = create_app(workers, router, max_failovers=args.max_failovers, membership=membership,
-                     rate_limit=rate_limit, hedge_delay_ms=args.hedge_delay_ms)
+                     rate_limit=rate_limit, hedge_delay_ms=args.hedge_delay_ms,
+                     queue_client=queue_client, store_client=store_client)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

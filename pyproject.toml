@@ -12,6 +12,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]
+# For infergrid.queue.redpanda.RedpandaClient -- a real Kafka-API broker backend,
+# not exercised by this project's tests (see that module's docstring).
+kafka = ["aiokafka>=0.11"]
 
 [tool.setuptools.packages.find]
 # Without this, setuptools' auto-discovery sees bench/ (benchmark and chaos-test

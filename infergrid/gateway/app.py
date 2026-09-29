@@ -17,10 +17,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from infergrid.common import sse
-from infergrid.common.schemas import ChatCompletionRequest, GenerateRequest
+from infergrid.common.schemas import BatchRequest, ChatCompletionRequest, GenerateRequest
 from infergrid.gateway.rate_limit import RateLimiter
 from infergrid.gateway.router import RoundRobinRouter, Router
 from infergrid.membership import SwimNode
+from infergrid.queue.base import QueueClient
+from infergrid.store.client import StoreClient
 
 # `read` bounds the gap between two streamed tokens, not the whole response.
 WORKER_TIMEOUT = httpx.Timeout(connect=2.0, read=120.0, write=10.0, pool=5.0)
@@ -240,6 +242,8 @@ def create_app(
     membership: SwimNode | None = None,
     rate_limit: RateLimiter | None = None,
     hedge_delay_ms: float | None = None,
+    queue_client: QueueClient | None = None,
+    store_client: StoreClient | None = None,
 ) -> FastAPI:
     workers = [w.rstrip("/") for w in workers]
     router = router or RoundRobinRouter()
@@ -288,13 +292,26 @@ def create_app(
             if membership is not None:
                 await membership.stop()
 
+    async def meter_usage(events: AsyncIterator[dict], tenant: str, request_id: str) -> AsyncIterator[dict]:
+        """Re-yields `events` unchanged, publishing a usage event once the answer
+        completes -- fire-and-forget, so a slow or unavailable broker never adds
+        latency to the response itself. See DESIGN.md section 3.6."""
+        async for event in events:
+            if event["type"] == "done" and queue_client is not None:
+                usage = event["usage"]
+                asyncio.create_task(queue_client.publish("usage", key=tenant, value={
+                    "request_id": request_id, "tenant_id": tenant,
+                    "tokens": usage["prompt_tokens"] + usage["completion_tokens"], "kind": "interactive",
+                }))
+            yield event
+
     app = FastAPI(title="InferGrid gateway", lifespan=lifespan)
     app.state.client = http_client
 
     @app.post("/v1/chat/completions")
     async def chat_completions(body: ChatCompletionRequest, request: Request):
+        tenant = request.headers.get("x-tenant-id", "default")
         if rate_limit is not None:
-            tenant = request.headers.get("x-tenant-id", "default")
             allowed, retry_after = rate_limit.allow(tenant)
             if not allowed:
                 load.rate_limited += 1
@@ -313,6 +330,7 @@ def create_app(
             worker, resp = await open_worker_stream(app.state.client, candidates, gen_req, load)
             events = worker_events(resp, on_close=functools.partial(load.release, worker))
         events = resilient_events(app.state.client, candidates, gen_req, worker, events, load, max_failovers)
+        events = meter_usage(events, tenant, request_id)
 
         completion_id = f"chatcmpl-{request_id}"
         created = int(time.time())
@@ -351,6 +369,39 @@ def create_app(
             },
             headers=headers,
         )
+
+    @app.post("/v1/batches")
+    async def create_batch(body: BatchRequest, request: Request):
+        """Accepts jobs immediately and returns; a worker processes each one
+        whenever its interactive queue is short (see DESIGN.md section 3.6)."""
+        if queue_client is None or store_client is None:
+            raise HTTPException(501, "batch inference needs --queue-url and --store-url")
+        tenant = request.headers.get("x-tenant-id", "default")
+        batch_id = uuid.uuid4().hex
+        job_ids = []
+        for job in body.requests:
+            job_id = uuid.uuid4().hex
+            job_ids.append(job_id)
+            await queue_client.publish("batch-jobs", key=tenant, value={
+                "job_id": job_id, "batch_id": batch_id, "tenant_id": tenant,
+                "messages": [m.model_dump() for m in job.messages], "max_tokens": job.max_tokens,
+            })
+        await store_client.put(f"batch:{batch_id}", job_ids)
+        return JSONResponse({"batch_id": batch_id, "job_ids": job_ids}, status_code=202)
+
+    @app.get("/v1/batches/{batch_id}")
+    async def get_batch(batch_id: str) -> dict:
+        if store_client is None:
+            raise HTTPException(501, "batch inference needs --store-url")
+        job_ids = await store_client.get(f"batch:{batch_id}")
+        if job_ids is None:
+            raise HTTPException(404, "no such batch")
+        jobs = []
+        for job_id in job_ids:
+            result = await store_client.get(f"batch-result:{job_id}")
+            jobs.append({"job_id": job_id, "status": "done" if result else "pending", **(result or {})})
+        return {"batch_id": batch_id, "total": len(jobs),
+                "done": sum(1 for j in jobs if j["status"] == "done"), "jobs": jobs}
 
     @app.get("/health")
     async def health() -> dict:

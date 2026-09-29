@@ -50,3 +50,16 @@ class GenerationResult:
 
     usage: Usage = field(default_factory=Usage)
     finish_reason: Literal["stop", "length"] = "stop"
+
+
+class BatchJobRequest(BaseModel):
+    messages: list[ChatMessage] = Field(min_length=1)
+    max_tokens: int | None = Field(default=None, ge=1, le=4096)
+
+
+class BatchRequest(BaseModel):
+    """POST /v1/batches body: many independent jobs submitted at once, processed
+    asynchronously by workers' idle capacity instead of synchronously like
+    /v1/chat/completions. See DESIGN.md section 3.6."""
+
+    requests: list[BatchJobRequest] = Field(min_length=1)
