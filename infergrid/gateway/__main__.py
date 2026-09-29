@@ -10,6 +10,7 @@ from infergrid.gateway.rate_limit import RateLimiter
 from infergrid.gateway.router import ROUTERS, make_router
 from infergrid.membership import SwimNode
 from infergrid.queue.cli import add_broker_args, build_queue_client
+from infergrid.semantic_cache import HashEmbedder, OllamaEmbedder, SemanticCache
 from infergrid.store.client import StoreClient
 
 
@@ -32,7 +33,23 @@ def main() -> None:
     parser.add_argument("--hedge-delay-ms", type=float, default=None,
                         help="also try the next-best worker if no token arrives within this long; omit to disable")
     add_broker_args(parser)
-    parser.add_argument("--store-url", default=None, help="a state store node's base URL; omit to disable /v1/batches")
+    parser.add_argument("--store-url", default=None,
+                        help="a state store node's base URL; needed for /v1/batches and --semantic-cache")
+    parser.add_argument("--semantic-cache", action="store_true",
+                        help="skip the LLM for a prompt within --semantic-cache-threshold of one already answered "
+                             "(needs --store-url)")
+    parser.add_argument("--semantic-cache-threshold", type=float, default=0.92)
+    parser.add_argument("--semantic-cache-max-entries", type=int, default=200, help="per tenant")
+    parser.add_argument("--embedder", choices=["hash", "ollama"], default="hash",
+                        help="'hash' is a dependency-free bag-of-words stand-in; 'ollama' uses a real embedding "
+                             "model via --embed-model, e.g. all-minilm (unverified in this project's own dev "
+                             "environment, see infergrid/semantic_cache.py)")
+    parser.add_argument("--embed-model", default="all-minilm")
+    parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    parser.add_argument("--dynamic-workers", action="store_true",
+                        help="route to whatever SWIM currently reports alive instead of a fixed --workers list, "
+                             "so a worker started later (e.g. autoscaled up) is picked up with no restart; "
+                             "needs --swim-port")
     args = parser.parse_args()
 
     workers = [w.strip() for w in args.workers.split(",") if w.strip()]
@@ -47,20 +64,30 @@ def main() -> None:
     if args.rate_limit_capacity:
         rate_limit = RateLimiter(args.rate_limit_capacity, args.rate_limit_per_second)
 
-    queue_client = store_client = None
-    if args.store_url and (args.queue_url or args.broker == "redpanda"):
-        queue_store_client = httpx.AsyncClient()
-        queue_client = build_queue_client(args, queue_store_client)
-        store_client = StoreClient(queue_store_client, args.store_url)
+    queue_client = store_client = semantic_cache = None
+    if args.store_url:
+        side_client = httpx.AsyncClient()
+        store_client = StoreClient(side_client, args.store_url)
+        if args.queue_url or args.broker == "redpanda":
+            queue_client = build_queue_client(args, side_client)
+        if args.semantic_cache:
+            embedder = (OllamaEmbedder(side_client, args.ollama_url, args.embed_model) if args.embedder == "ollama"
+                       else HashEmbedder())
+            semantic_cache = SemanticCache(store_client, embedder, args.semantic_cache_threshold,
+                                           args.semantic_cache_max_entries)
 
-    print(f"gateway on http://{args.host}:{args.port} -> {len(workers)} workers, router={args.router}"
+    print(f"gateway on http://{args.host}:{args.port} -> {len(workers)} workers"
+          + (" (+ whatever SWIM adds dynamically)" if args.dynamic_workers else "") + f", router={args.router}"
           + (f", swim on {args.host}:{args.swim_port}" if membership else "")
           + (f", rate limit {args.rate_limit_capacity}/{args.rate_limit_per_second}s" if rate_limit else "")
           + (f", hedge after {args.hedge_delay_ms}ms" if args.hedge_delay_ms else "")
-          + (f", batches via {args.broker} broker" if queue_client else ""))
+          + (f", batches via {args.broker} broker" if queue_client else "")
+          + (f", semantic cache ({args.embedder} embedder, threshold={args.semantic_cache_threshold})"
+             if semantic_cache else ""))
     app = create_app(workers, router, max_failovers=args.max_failovers, membership=membership,
                      rate_limit=rate_limit, hedge_delay_ms=args.hedge_delay_ms,
-                     queue_client=queue_client, store_client=store_client)
+                     queue_client=queue_client, store_client=store_client, semantic_cache=semantic_cache,
+                     dynamic_workers=args.dynamic_workers)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

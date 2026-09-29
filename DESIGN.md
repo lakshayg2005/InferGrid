@@ -409,12 +409,104 @@ fix, since the worker never actually refuses the request.
   instead, so the race is genuine.
 
 ### 3.9 AI features (pre-trained only, no training)
-- **Semantic cache**: prompts are embedded with a small pre-trained model
-  (`all-minilm` via Ollama). A new prompt within a cosine-similarity threshold of
-  a cached one is answered from the cache, which lives in the state store,
-  sharded by tenant.
-- **Predictive autoscaling**: Holt-Winters forecasting on request rate scales
-  workers ahead of spikes (statistical, no training).
+
+#### Semantic cache (`infergrid/semantic_cache.py`)
+
+A new prompt within a cosine-similarity threshold of one already answered is
+served straight from the cache, skipping a worker (and the LLM) entirely --
+distinct from the worker-side prefix cache (`worker/prefix_cache.py`), which
+still recomputes the *new* tokens of a similar-but-not-identical prompt. Two
+`Embedder` implementations behind the same interface, the same split as
+`worker/backends/` (sim vs Ollama) and `queue/` (from-scratch broker vs
+Redpanda):
+
+- `HashEmbedder` (default): the hashing trick -- each word hashes into one of
+  `dims` buckets, counted, L2-normalized -- gives a real, fully tested
+  bag-of-words vector with no model or network call, at the cost of being a
+  *lexical* similarity measure: it cannot know "car" and "automobile" are
+  related, only that two texts sharing more words are more similar.
+- `OllamaEmbedder`: real embeddings from a small pre-trained model (e.g.
+  `all-minilm`) via Ollama's `/api/embed`. **Unverified against a live
+  server** -- no Ollama process was running while this was written; same
+  caveat as `infergrid/queue/redpanda.py`.
+
+The cache lives in the Phase 4 state store, one JSON list per tenant
+(`semantic-cache:{tenant}`) rather than a key per entry: there is no way to
+enumerate a key range in that store's `/kv` API, and a tenant's cache is
+small enough that "fetch the whole list, compare in Python" is the honest,
+simple choice -- a real deployment would use a proper vector index. Capped
+at `max_entries`, oldest evicted first.
+
+`scripts/semantic_cache_demo.py` measures the real payoff against a workload
+of FAQ-style questions asked with light paraphrasing: a genuine multi-worker,
+multi-process run, not just the logic in isolation
+(tests/test_semantic_cache.py). A representative run: 15 paraphrases that
+could plausibly hit against `HashEmbedder`'s lexical measure, 11 actually did
+(73%), and a cache hit answered in ~8ms against a ~1.26s mean for an answer
+that had to go through a (simulated) LLM -- roughly two orders of magnitude,
+for the fraction of traffic that is genuinely a repeat question. The 27% miss
+rate on paraphrases is not hidden: it is `HashEmbedder` doing exactly what
+its docstring says a lexical measure can and cannot do; `OllamaEmbedder`
+would very plausibly close most of that gap, unverified as it is here.
+
+#### Predictive autoscaling (`infergrid/autoscale/`)
+
+Holt-Winters triple exponential smoothing (`forecast.py::HoltWinters`, the
+textbook algorithm, additive seasonality) forecasts the *next* window's
+request rate from a repeating pattern already seen, and `controller.py`
+turns that forecast into a target worker count. The payoff being measured by
+`scripts/autoscale_demo.py` is specifically about *when in a repeating cycle*
+a spike lands -- not whether a rate can be forecast at all (`Controller`'s
+docstring spells out the comparison): a **reactive** policy sizes for the
+rate the tick that *just ended* had (the standard "scale once you see the
+load" approach); a **predictive** policy sizes for `forecast(1)` instead,
+so extra capacity is warm *before* the spike arrives, one tick sooner,
+provided the pattern has already been learned.
+
+Making this real, not just a forecasting-accuracy exercise, needed one more
+piece: a worker started *after* the gateway did must still become routable
+with no gateway restart. `create_app(..., dynamic_workers=True)` makes
+`alive_workers()` return whatever SWIM currently reports alive instead of a
+list fixed at startup -- a worker autoscaled up joins the same SWIM group
+(seeded on the existing workers, `LocalCluster.scale_workers()`) and becomes
+routable within a couple of gossip rounds. `LoadTracker`'s per-worker dicts
+became `defaultdict`s for this, since a dynamically-joined worker has no
+entry seeded at gateway startup.
+
+**A real bug found via `scripts/autoscale_demo.py`, not by any unit test:**
+scaling *down* (killing workers no longer needed) exposed that on Windows,
+connecting to a port whose listening process was *just* terminated does not
+fail fast -- the new connection's SYN is simply not answered, so the caller
+hangs until its own connect timeout fires, rather than getting an immediate
+refused-connection error the way it does on Linux. The gateway's
+`WORKER_TIMEOUT` had `connect=2.0` (generous, matching a real network's
+possible latency); at that setting, a request that round-robined onto two or
+three just-killed workers before reaching a live one paid four-to-six
+*seconds* of pure timeout -- a multi-second stall, not the fast, near-instant
+failover this project relies on everywhere else a worker turns out to be
+unreachable (a crashed worker, a SWIM-confirmed-DEAD member). Diagnosed by
+isolating the exact 2.0s-per-hop pattern in a minimal repro
+(`client.get()` against a port right after `proc.terminate(); proc.wait()`
+returned) before touching any autoscaling code. Fixed: `connect=0.5` -- a
+genuine localhost connection establishes in low milliseconds, so even that
+is generous, and a stale or dead candidate now fails in a fraction of a
+second instead of two. `scripts/autoscale_demo.py` also gives SWIM a
+deliberate settle period after every scaling change before sending more
+traffic, which is realistic operational practice, not a workaround for this
+bug -- the timeout fix is what makes an *unavoidably* stale routing view (the
+gossip round or two SWIM genuinely needs) cheap instead of expensive.
+
+A representative comparison (one low-low-high-high cycle, live): predictive
+scaled to 4 workers one tick ahead of the spike and served it at ~700ms
+mean / ~730ms p99 with zero failed requests; reactive was still on 1 worker
+when the same spike hit, at ~1.4-1.7s mean / ~2.6s p99, and occasionally a
+few requests failed outright under the compounded load of the spike arriving
+at the same moment three new workers were being started to catch up. That
+gap, and reactive's occasional outright failures, are the real, repeatable
+cost of *reacting* to a load pattern instead of *anticipating* one already
+learned -- not a hidden thumb on the scale (`predictive["failed"] == 0` is
+asserted in the script; reactive's occasional failures are not papered over
+by excluding them from the printed comparison).
 
 ## 4. Request flows
 
@@ -442,6 +534,8 @@ published → offset committed → client polls `GET /v1/batches/{id}`.
 | Storage node down | Sloppy quorum + hinted handoff; read repair on recovery |
 | Worker crashes mid-batch-job | Uncommitted job redelivered to another worker once its session times out; idempotent (store lookup) so no duplicate work |
 | A batch job keeps failing | Retried with backoff up to `max_attempts`, then sent to `{topic}.dlq` instead of blocking the partition forever |
+| A worker is scaled down (autoscaling) | Terminated; `WORKER_TIMEOUT.connect=0.5` bounds how long a request that round-robins onto it before SWIM notices costs |
+| A worker is scaled up (autoscaling) | Joins the SWIM group on its own; routable once gossiped, no gateway restart (`dynamic_workers=True`) |
 
 **Mid-stream failover in detail.** The gateway remembers every token it has
 forwarded. When a worker's stream breaks (connection reset, error event, or the

@@ -4,6 +4,7 @@ The gateway is stateless, so any number of copies can run behind a load balancer
 """
 
 import asyncio
+import collections
 import functools
 import json
 import logging
@@ -22,10 +23,20 @@ from infergrid.gateway.rate_limit import RateLimiter
 from infergrid.gateway.router import RoundRobinRouter, Router
 from infergrid.membership import SwimNode
 from infergrid.queue.base import QueueClient
+from infergrid.semantic_cache import SemanticCache
 from infergrid.store.client import StoreClient
 
-# `read` bounds the gap between two streamed tokens, not the whole response.
-WORKER_TIMEOUT = httpx.Timeout(connect=2.0, read=120.0, write=10.0, pool=5.0)
+# `read` bounds the gap between two streamed tokens, not the whole response. `connect`
+# is deliberately tight: a genuine localhost connection establishes in low milliseconds,
+# and a generous connect timeout turns "candidate is dead but SWIM hasn't said so yet"
+# into a multi-second stall rather than a fast failover. Found via scripts/autoscale_demo.py:
+# on Windows, connecting to a port whose listening process was just killed does not get
+# an immediate refused-connection error -- the SYN is simply not answered, so the caller
+# hangs until ITS OWN connect timeout fires. At the old connect=2.0, a request that
+# round-robined onto several just-killed workers before reaching a live one paid multiple
+# *seconds* of pure timeout, not the near-instant failover this design otherwise relies on
+# everywhere else (worker crashes, DEAD-classified SWIM members, etc. all fail fast).
+WORKER_TIMEOUT = httpx.Timeout(connect=0.5, read=120.0, write=10.0, pool=5.0)
 
 log = logging.getLogger("infergrid.gateway")
 
@@ -35,14 +46,23 @@ class WorkerStreamError(Exception):
 
 
 class LoadTracker:
-    """Requests this gateway has in flight on each worker, and totals for /stats."""
+    """Requests this gateway has in flight on each worker, and totals for /stats.
+
+    `defaultdict`, not a dict fixed to the workers given at startup: with
+    `dynamic_workers=True` (see create_app), a worker that joins later purely
+    through SWIM gossip -- never listed at startup -- must still get a load
+    entry the first time it's routed to, or reserving it would raise a
+    KeyError. See DESIGN.md section 3.9's predictive autoscaling.
+    """
 
     def __init__(self, workers: Sequence[str]):
-        self.in_flight = {w: 0 for w in workers}
-        self.routed = {w: 0 for w in workers}
+        self.in_flight = collections.defaultdict(int, {w: 0 for w in workers})
+        self.routed = collections.defaultdict(int, {w: 0 for w in workers})
         self.failovers = 0
         self.hedges = 0
         self.rate_limited = 0
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     def reserve(self, worker: str) -> None:
         self.in_flight[worker] += 1
@@ -244,23 +264,37 @@ def create_app(
     hedge_delay_ms: float | None = None,
     queue_client: QueueClient | None = None,
     store_client: StoreClient | None = None,
+    semantic_cache: SemanticCache | None = None,
+    dynamic_workers: bool = False,
 ) -> FastAPI:
     workers = [w.rstrip("/") for w in workers]
     router = router or RoundRobinRouter()
     load = LoadTracker(workers)
 
     def alive_workers() -> list[str]:
-        """The configured workers, filtered to ones SWIM currently reports alive.
+        """The workers this gateway will route to right now.
 
-        This is what stops the gateway from wasting a connection attempt -- and the
-        seconds-long wait for it to time out or be refused -- on a worker that is
-        already known to be dead; see DESIGN.md section 3.4. Falls back to the full
-        list if membership has no alive workers yet (e.g. still converging right
-        after startup) so a slow bootstrap never looks like a total outage.
+        With `dynamic_workers=False` (the default): the configured `workers`,
+        filtered to ones SWIM currently reports alive. This is what stops the
+        gateway from wasting a connection attempt -- and the seconds-long wait
+        for it to time out or be refused -- on a worker that is already known
+        to be dead; see DESIGN.md section 3.4. Falls back to the full list if
+        membership has no alive workers yet (e.g. still converging right after
+        startup) so a slow bootstrap never looks like a total outage.
+
+        With `dynamic_workers=True`: *only* whatever SWIM currently reports
+        alive, with no static list to fall back to -- a worker that joins the
+        SWIM group after this gateway started (autoscaled up, see
+        DESIGN.md section 3.9 and infergrid/autoscale/) becomes routable
+        within a couple of gossip rounds, with no gateway restart needed.
+        Needs `membership` to mean anything; with none, every request 503s
+        instead of silently routing to a `workers` list this mode ignores.
         """
         if membership is None:
-            return workers
-        alive = set(membership.alive_http_urls())
+            return [] if dynamic_workers else workers
+        alive = membership.alive_http_urls()
+        if dynamic_workers:
+            return alive
         return [w for w in workers if w in alive] or workers
 
     def sync_capacities() -> None:
@@ -305,6 +339,23 @@ def create_app(
                 }))
             yield event
 
+    async def cached_events(content: str) -> AsyncIterator[dict]:
+        yield {"type": "token", "index": 0, "text": content}
+        yield {"type": "done", "finish_reason": "stop",
+               "usage": {"prompt_tokens": 0, "cached_tokens": 0, "completion_tokens": 0}}
+
+    async def remember_in_cache(events: AsyncIterator[dict], tenant: str, prompt: str) -> AsyncIterator[dict]:
+        """Re-yields `events` unchanged, storing the finished answer in the
+        semantic cache once it completes -- fire-and-forget, same reasoning
+        as meter_usage. See DESIGN.md section 3.9."""
+        parts = []
+        async for event in events:
+            if event["type"] == "token":
+                parts.append(event["text"])
+            elif event["type"] == "done":
+                asyncio.create_task(semantic_cache.store_entry(tenant, prompt, "".join(parts)))
+            yield event
+
     app = FastAPI(title="InferGrid gateway", lifespan=lifespan)
     app.state.client = http_client
 
@@ -320,17 +371,30 @@ def create_app(
                                     status_code=429, headers={"Retry-After": str(retry_after)})
 
         request_id = uuid.uuid4().hex
-        gen_req = GenerateRequest(request_id=request_id, messages=body.messages, max_tokens=body.max_tokens)
-        sync_capacities()
-        candidates = router.candidates(gen_req, alive_workers(), load.in_flight)
+        prompt_text = body.messages[-1].content if body.messages else ""
+        cache_hit = await semantic_cache.lookup(tenant, prompt_text) if semantic_cache is not None else None
 
-        if hedge_delay_ms:
-            worker, events = await open_hedged_events(app.state.client, candidates, gen_req, load, hedge_delay_ms / 1000)
+        if cache_hit is not None:
+            load.cache_hits += 1
+            worker = "semantic-cache"
+            events = cached_events(cache_hit.content)
         else:
-            worker, resp = await open_worker_stream(app.state.client, candidates, gen_req, load)
-            events = worker_events(resp, on_close=functools.partial(load.release, worker))
-        events = resilient_events(app.state.client, candidates, gen_req, worker, events, load, max_failovers)
-        events = meter_usage(events, tenant, request_id)
+            if semantic_cache is not None:
+                load.cache_misses += 1
+            gen_req = GenerateRequest(request_id=request_id, messages=body.messages, max_tokens=body.max_tokens)
+            sync_capacities()
+            candidates = router.candidates(gen_req, alive_workers(), load.in_flight)
+
+            if hedge_delay_ms:
+                worker, events = await open_hedged_events(app.state.client, candidates, gen_req, load,
+                                                           hedge_delay_ms / 1000)
+            else:
+                worker, resp = await open_worker_stream(app.state.client, candidates, gen_req, load)
+                events = worker_events(resp, on_close=functools.partial(load.release, worker))
+            events = resilient_events(app.state.client, candidates, gen_req, worker, events, load, max_failovers)
+            events = meter_usage(events, tenant, request_id)
+            if semantic_cache is not None:
+                events = remember_in_cache(events, tenant, prompt_text)
 
         completion_id = f"chatcmpl-{request_id}"
         created = int(time.time())
@@ -411,6 +475,7 @@ def create_app(
     async def stats() -> dict:
         return {"router": router.name, "in_flight": load.in_flight, "routed": load.routed,
                 "failovers": load.failovers, "hedges": load.hedges, "rate_limited": load.rate_limited,
+                "cache_hits": load.cache_hits, "cache_misses": load.cache_misses,
                 "alive_workers": alive_workers()}
 
     @app.get("/membership")

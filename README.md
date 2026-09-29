@@ -3,7 +3,8 @@
 A distributed LLM serving platform. A gateway sits in front of many LLM workers and
 makes them behave like one fast, cheap and fault-tolerant AI service: cache-aware
 routing, a sharded and replicated state store, a Kafka-compatible message queue for
-batch inference, and streams that survive worker crashes.
+batch inference, a semantic response cache, Holt-Winters predictive autoscaling,
+and streams that survive worker crashes.
 
 See [DESIGN.md](DESIGN.md) for the architecture and the reasoning behind it.
 
@@ -16,7 +17,7 @@ See [DESIGN.md](DESIGN.md) for the architecture and the reasoning behind it.
 | 3 | Mid-stream failover, SWIM failure detection, load shedding, rate limiting, hedged requests | ✅ Done |
 | 4 | Sharded, replicated state store | ✅ Done |
 | 5 | Batch inference, usage metering, message queue | ✅ Done |
-| 6 | Semantic cache, predictive autoscaling | |
+| 6 | Semantic cache, predictive autoscaling | ✅ Done |
 | 7 | Kubernetes, observability, chaos tests, demo UI | |
 
 ## Quick start
@@ -53,7 +54,7 @@ python scripts/run_local.py --workers 2 --backend ollama
 |---|---|---|
 | Gateway | `POST /v1/chat/completions` | OpenAI-compatible chat, streaming or not |
 | Gateway | `GET /health` | Router, worker list and which workers SWIM currently reports alive |
-| Gateway | `GET /stats` | Requests in flight, routed, failovers, hedges, rate-limit rejections |
+| Gateway | `GET /stats` | Requests in flight, routed, failovers, hedges, rate-limit rejections, semantic-cache hits/misses |
 | Gateway | `GET /membership` | This gateway's SWIM view (empty if `--swim-port` not set) |
 | Worker | `POST /generate` | Internal: stream indexed tokens as SSE; 503s if at capacity (load shedding) |
 | Worker | `GET /stats` | Queue depth, prefix-cache hit rate |
@@ -239,6 +240,76 @@ this project's development environment, so unlike everything else in this
 README, this path has no test or demo run behind it. See that module's
 docstring before trusting it.
 
+## Semantic cache
+
+```bash
+python scripts/semantic_cache_demo.py         # ~15 seconds
+```
+
+A prompt within a cosine-similarity threshold of one already answered is
+served straight from the cache (`infergrid/semantic_cache.py`, backed by the
+Phase 4 store) -- no worker, no LLM call at all, unlike the worker-side
+prefix cache which still recomputes a similar-but-not-identical prompt's new
+tokens. Default embedder is `HashEmbedder`, a dependency-free bag-of-words
+stand-in (the hashing trick); `OllamaEmbedder` (`--embedder ollama`) uses a
+real pre-trained model via Ollama, **unverified in this environment** (no
+Ollama server was running while it was written).
+
+`scripts/semantic_cache_demo.py` runs a real gateway + store + two workers
+and measures the actual payoff on FAQ-style questions asked with light
+paraphrasing, not just the caching logic in isolation
+(tests/test_semantic_cache.py, tests/test_semantic_cache_gateway.py). A
+representative run:
+
+```
+30 requests: 19 misses, 11 hits (gateway /stats agrees: 19 misses, 11 hits)
+of 15 paraphrases that could plausibly hit (HashEmbedder measures word overlap, not meaning),
+11 actually did (73%)
+mean miss latency 1260ms vs mean hit latency 8ms (155x faster)
+
+PASS
+```
+
+The 73% is reported honestly, not inflated to 100%: a lexical embedder
+recognizing 73% of hand-written paraphrases as the same question, while
+missing the loosest ones, is exactly what its docstring says it can and
+cannot do. See DESIGN.md section 3.9.
+
+## Predictive autoscaling
+
+```bash
+python scripts/autoscale_demo.py               # ~35 seconds
+```
+
+Holt-Winters triple exponential smoothing (`infergrid/autoscale/forecast.py`,
+written from scratch, tested against known series in tests/test_forecast.py)
+forecasts the *next* window's request rate from a repeating pattern already
+learned, so a scale-up can happen before a recurring spike lands, not only
+once queue depth already shows the damage. `scripts/autoscale_demo.py` runs
+two full real clusters through the identical low-low-high-high load cycle --
+one scaled reactively (sized for the rate the tick that just ended had), one
+predictively (sized for `forecast(1)`) -- and compares them head to head.
+Making this real needed a gateway that can route to a worker started *after*
+it did: `create_app(..., dynamic_workers=True)` routes to whatever SWIM
+currently reports alive rather than a fixed list, so an autoscaled-up worker
+becomes routable within a couple of gossip rounds, no restart.
+
+```
+reactive:   tick 2 (high, n=16): workers=1  mean=1638ms p99=2611ms
+predictive: tick 2 (high, n=16): workers=4  mean= 713ms p99= 728ms   <- scaled ahead of the spike
+
+spike-tick latency: reactive p99=2611ms (occasional failed requests) vs predictive p99=728ms (0 failed)
+
+PASS
+```
+
+**A real bug found via this script:** scaling a worker down exposed that on
+Windows, connecting to a port whose listening process was just killed hangs
+until the *caller's own* connect timeout fires instead of failing fast --
+turning a routing hiccup that should cost milliseconds into several seconds
+per stale candidate. Fixed by tightening the gateway's connect timeout
+(2.0s -> 0.5s); see DESIGN.md section 3.9 for the full diagnosis.
+
 ## Tests
 
 ```bash
@@ -257,10 +328,13 @@ infergrid/
   queue/           from-scratch Kafka-compatible broker (broker/), HTTP client, retry/DLQ consumer,
                    an unverified real-Kafka client (redpanda.py)
   billing/         idempotent usage-to-billing consumer
-  local_cluster.py start/stop worker, gateway, store-node, broker and billing processes
+  semantic_cache.py cosine-similarity response cache (HashEmbedder, unverified OllamaEmbedder)
+  autoscale/       Holt-Winters forecasting (forecast.py) + a worker-count controller.py
+  local_cluster.py start/stop worker, gateway, store-node, broker and billing processes;
+                   scale_workers() for live autoscaling
   loadgen.py       realistic multi-turn chat workload (open-loop)
 scripts/           run_local.py (start a cluster), chat.py (terminal client), benchmark.py,
-                   chaos.py, store_chaos.py, batch_demo.py
+                   chaos.py, store_chaos.py, batch_demo.py, semantic_cache_demo.py, autoscale_demo.py
 bench/results/     saved benchmark and chaos runs
 tests/             tests/test_hedging.py and tests/test_store_http.py use real sockets;
                    everything else is fast in-process ASGI

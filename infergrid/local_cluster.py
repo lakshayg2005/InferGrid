@@ -39,6 +39,9 @@ class LocalCluster:
     worker_base_port: int = 8701
     quiet: bool = False  # hide process output (benchmarks)
     queue: bool = False  # also run a broker + a single-node store + billing consumer (Phase 5)
+    semantic_cache: bool = False  # gateway skips the LLM for a near-duplicate prompt (Phase 6); needs a store
+    semantic_cache_threshold: float = 0.92
+    dynamic_workers: bool = False  # gateway routes to whatever SWIM reports alive; see scale_workers()
     queue_port: int = 8900
     store_port: int = 8950
     worker_urls: list[str] = field(default_factory=list, init=False)
@@ -63,16 +66,20 @@ class LocalCluster:
     def start(self) -> None:
         try:
             queue_args = []
-            if self.queue:
-                self._broker = _Process(self.queue_url, self._spawn(["-m", "infergrid.queue.broker",
-                                        "--port", str(self.queue_port)]), lambda b: b.get("status") == "ok")
+            needs_store = self.queue or self.semantic_cache
+            if needs_store:
                 store_cmd = ["-m", "infergrid.store", "--port", str(self.store_port), "--nodes", self.store_url,
                             "--n-replicas", "1", "--w", "1", "--r", "1"]
                 self._store = _Process(self.store_url, self._spawn(store_cmd),
                                        lambda b: b.get("addr") == self.store_url, store_cmd)
-                for p in (self._broker, self._store):
-                    if not _wait_until_healthy(p):
-                        raise RuntimeError(f"{p.url} did not start (is the port already in use?)")
+                if not _wait_until_healthy(self._store):
+                    raise RuntimeError(f"{self._store.url} did not start (is the port already in use?)")
+
+            if self.queue:
+                self._broker = _Process(self.queue_url, self._spawn(["-m", "infergrid.queue.broker",
+                                        "--port", str(self.queue_port)]), lambda b: b.get("status") == "ok")
+                if not _wait_until_healthy(self._broker):
+                    raise RuntimeError(f"{self._broker.url} did not start (is the port already in use?)")
                 queue_args = ["--queue-url", self.queue_url, "--store-url", self.store_url]
 
                 billing_cmd = ["-m", "infergrid.billing", "--queue-url", self.queue_url, "--store-url", self.store_url]
@@ -93,9 +100,14 @@ class LocalCluster:
                 self._workers.append(
                     _Process(url, self._spawn(cmd), lambda b, name=name: b.get("worker_id") == name, cmd))
 
+            gateway_store_args = (queue_args if self.queue else ["--store-url", self.store_url]) if needs_store else []
             cmd = ["-m", "infergrid.gateway", "--port", str(self.gateway_port), "--workers", ",".join(self.worker_urls),
                    "--router", self.router, "--epsilon", str(self.epsilon), "--max-failovers", str(self.max_failovers),
-                   *queue_args]
+                   *gateway_store_args]
+            if self.semantic_cache:
+                cmd += ["--semantic-cache", "--semantic-cache-threshold", str(self.semantic_cache_threshold)]
+            if self.dynamic_workers:
+                cmd += ["--dynamic-workers"]
             if self.membership:
                 cmd += ["--swim-port", str(self.gateway_port + self.swim_offset), "--seeds", ",".join(swim_addrs)]
             if self.hedge_delay_ms:
@@ -128,6 +140,38 @@ class LocalCluster:
         worker = self._workers[index]
         worker.proc = self._spawn(worker.args)
         return _wait_until_healthy(worker)
+
+    def scale_workers(self, target: int) -> None:
+        """Grow or shrink the running worker pool to exactly `target`, without
+        touching the gateway process -- it must be running with
+        `dynamic_workers=True` to notice new workers, since it was started
+        with (at most) `self.workers` of them in its own --workers list.
+        Used by scripts/autoscale_demo.py; see DESIGN.md section 3.9.
+        """
+        current = len(self._workers)
+        if target > current:
+            all_ports = [self.worker_base_port + i for i in range(target)]
+            swim_addrs = [f"127.0.0.1:{p + self.swim_offset}" for p in all_ports[:current]]
+            for i in range(current, target):
+                port = all_ports[i]
+                name = f"worker-{i + 1}"
+                url = f"http://127.0.0.1:{port}"
+                cmd = ["-m", "infergrid.worker", "--id", name, "--port", str(port),
+                       "--backend", self.backend, "--model", self.model]
+                if self.membership:
+                    cmd += ["--swim-port", str(port + self.swim_offset), "--seeds", ",".join(swim_addrs)]
+                proc = _Process(url, self._spawn(cmd), lambda b, name=name: b.get("worker_id") == name, cmd)
+                if not _wait_until_healthy(proc):
+                    raise RuntimeError(f"{url} did not start while scaling up")
+                self._workers.append(proc)
+                self.worker_urls.append(url)
+                swim_addrs.append(f"127.0.0.1:{port + self.swim_offset}")
+        elif target < current:
+            for _ in range(current - target):
+                p = self._workers.pop()
+                self.worker_urls.pop()
+                p.proc.terminate()
+                p.proc.wait()
 
     def gateway_alive(self) -> bool:
         return self._gateway is not None and self._gateway.proc.poll() is None
