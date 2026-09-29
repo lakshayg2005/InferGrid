@@ -1,6 +1,7 @@
 """Start and stop a cluster of worker and gateway processes on this machine.
 
-Used by scripts/run_local.py, scripts/benchmark.py and scripts/chaos.py.
+Used by scripts/run_local.py, scripts/benchmark.py and scripts/chaos.py. `StoreCluster`
+does the same for the Phase 4 state store; used by scripts/store_chaos.py.
 """
 
 import subprocess
@@ -106,6 +107,68 @@ class LocalCluster:
         return subprocess.Popen([sys.executable, *args], cwd=ROOT, stdout=out, stderr=out)
 
     def __enter__(self) -> "LocalCluster":
+        self.start()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.stop()
+
+
+@dataclass
+class StoreCluster:
+    nodes: int = 4
+    n_replicas: int = 3
+    w: int = 2
+    r: int = 2
+    membership: bool = True
+    swim_offset: int = 1000
+    base_port: int = 8801
+    quiet: bool = False
+    node_urls: list[str] = field(default_factory=list, init=False)
+    _nodes: list[_Process] = field(default_factory=list, init=False)
+
+    def start(self) -> None:
+        try:
+            ports = [self.base_port + i for i in range(self.nodes)]
+            self.node_urls = [f"http://127.0.0.1:{p}" for p in ports]
+            swim_addrs = [f"127.0.0.1:{p + self.swim_offset}" for p in ports]
+
+            for i, (port, url) in enumerate(zip(ports, self.node_urls)):
+                cmd = ["-m", "infergrid.store", "--port", str(port), "--nodes", *self.node_urls,
+                       "--n-replicas", str(self.n_replicas), "--w", str(self.w), "--r", str(self.r)]
+                if self.membership:
+                    seeds = [a for j, a in enumerate(swim_addrs) if j != i]
+                    cmd += ["--swim-port", str(port + self.swim_offset), "--seeds", ",".join(seeds)]
+                self._nodes.append(_Process(url, self._spawn(cmd), lambda b, url=url: b.get("addr") == url, cmd))
+
+            for p in self._nodes:
+                if not _wait_until_healthy(p):
+                    raise RuntimeError(f"{p.url} did not start (is the port already in use?)")
+        except BaseException:
+            self.stop()
+            raise
+
+    def stop(self) -> None:
+        for p in self._nodes:
+            p.proc.terminate()
+        for p in self._nodes:
+            p.proc.wait()
+
+    def kill(self, index: int) -> None:
+        proc = self._nodes[index].proc
+        proc.kill()
+        proc.wait()
+
+    def restart(self, index: int) -> bool:
+        node = self._nodes[index]
+        node.proc = self._spawn(node.args)
+        return _wait_until_healthy(node)
+
+    def _spawn(self, args: list[str]) -> subprocess.Popen:
+        out = subprocess.DEVNULL if self.quiet else None
+        return subprocess.Popen([sys.executable, *args], cwd=ROOT, stdout=out, stderr=out)
+
+    def __enter__(self) -> "StoreCluster":
         self.start()
         return self
 

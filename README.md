@@ -14,7 +14,7 @@ See [DESIGN.md](DESIGN.md) for the architecture and the reasoning behind it.
 | 1 | Gateway + workers (simulated + Ollama), OpenAI-compatible streaming, round-robin routing, failover before first token | ✅ Done |
 | 2 | Cache-aware routing (prefix hashing + bounded-load consistent hashing), benchmarks | ✅ Done |
 | 3 | Mid-stream failover, SWIM failure detection, load shedding, rate limiting, hedged requests | ✅ Done |
-| 4 | Sharded, replicated state store | |
+| 4 | Sharded, replicated state store | ✅ Done |
 | 5 | Kafka: batch inference, usage metering | |
 | 6 | Semantic cache, predictive autoscaling | |
 | 7 | Kubernetes, observability, chaos tests, demo UI | |
@@ -58,6 +58,8 @@ python scripts/run_local.py --workers 2 --backend ollama
 | Worker | `POST /generate` | Internal: stream indexed tokens as SSE; 503s if at capacity (load shedding) |
 | Worker | `GET /stats` | Queue depth, prefix-cache hit rate |
 | Worker | `GET /membership` | This worker's SWIM view (empty if `--swim-port` not set) |
+| Store | `GET/PUT/DELETE /kv/{key}` | Client-facing coordinator API: any node accepts any key |
+| Store | `GET /stats` | Key count, hints currently held for down peers, this node's alive-node view |
 
 Every response carries `X-InferGrid-Worker` (which worker served it) and `X-Request-Id`.
 
@@ -165,6 +167,28 @@ checked word for word against the answer the simulator gives when nothing fails.
   result (0 lost/corrupted, membership improving rather than hurting p99) has
   been consistent since both fixes landed.
 
+## State store
+
+```bash
+python scripts/store_chaos.py                # ~10 seconds; --verbose to see per-node diagnostics
+```
+
+A Dynamo-style leaderless key-value store (`infergrid/store/`): consistent
+hashing picks a 3-node preference list per key, quorum reads/writes
+(`w=2, r=2` by default), sloppy quorum + hinted handoff cover a down replica,
+and read repair heals stale ones. `tests/test_store.py` and
+`tests/test_store_http.py` cover the logic in-process; `scripts/store_chaos.py`
+kills a real node process mid-run and checks writes/reads still succeed and
+stay correct, hinted handoff delivers what was written while it was down, and
+read repair backfills what it already held before it crashed. See DESIGN.md
+section 3.5 for the design and two real bugs this chaos script found (a SWIM
+gossip gap that left a rejoining node blind to its own peers, and a store
+write path treating "merely suspected" the same as "confirmed dead," which
+burned through its small spare pool under real load) -- plus an honestly
+unresolved third finding: an occasional, non-self-healing membership partition
+under sustained load with more than 4 nodes on a modest dev machine, recorded
+as a `FAIL` with a write-failure count rather than papered over.
+
 ## Tests
 
 ```bash
@@ -179,9 +203,12 @@ infergrid/
   membership/      SWIM failure detection over real UDP sockets
   worker/          worker API, prefix cache, load shedding, backends (sim, ollama)
   gateway/         gateway API, routing, mid-stream failover, hedging, rate limiting
-  local_cluster.py start/stop worker and gateway processes
+  store/           Dynamo-style replicated key-value store: quorums, hinted handoff, read repair
+  local_cluster.py start/stop worker, gateway and store-node processes
   loadgen.py       realistic multi-turn chat workload (open-loop)
-scripts/           run_local.py (start a cluster), chat.py (terminal client), benchmark.py, chaos.py
+scripts/           run_local.py (start a cluster), chat.py (terminal client), benchmark.py,
+                   chaos.py, store_chaos.py
 bench/results/     saved benchmark and chaos runs
-tests/             tests/test_hedging.py uses real sockets; everything else is fast in-process ASGI
+tests/             tests/test_hedging.py and tests/test_store_http.py use real sockets;
+                   everything else is fast in-process ASGI
 ```

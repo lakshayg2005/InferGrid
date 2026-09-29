@@ -80,6 +80,34 @@ async def test_gossip_reaches_a_node_with_no_direct_seed(cluster: Cluster):
     assert c.members[a.addr].metadata == {"http_url": "http://a"}
 
 
+async def test_a_late_joiner_learns_about_a_seed_with_no_pending_gossip_about_itself(cluster: Cluster):
+    """The bug this guards against: a node's self-announcement gossip entry (seeded
+    once in start()) drains after gossip_retransmits sends, same as any other gossip
+    entry -- in a cluster that has been running a while, it is normally long gone.
+    A node joining afterwards, seeded on that node, still pings it successfully every
+    round, but a bare successful ping/ack proves nothing on its own: receiving an ack
+    only resolves a pending future, it never updates self.members. Unless the seed
+    happens to have *some* gossip about itself still pending at that exact moment
+    -- luck, not a guarantee, exactly like the restart bug below -- the joiner's
+    membership table would stay {itself} forever. Found via scripts/store_chaos.py,
+    where a restarted store node's alive_nodes() stayed empty of its peers well past
+    every wait budget the chaos script gave it.
+    """
+    a = cluster.add(metadata={"http_url": "http://a"})
+    await cluster.start()
+    a._gossip.clear()  # force-exhaust: a's self-announcement has already drained
+
+    b = cluster.add(seeds=[a.addr], metadata={"http_url": "http://b"})
+    await b.start()
+    assert await wait_until(lambda: a.addr in b.members and b.members[a.addr].state == ALIVE), (
+        "a joiner must learn about a seed even when the seed has no gossip news pending"
+    )
+    assert b.members[a.addr].metadata == {"http_url": "http://a"}
+    assert await wait_until(lambda: b.addr in a.members and a.members[b.addr].state == ALIVE), (
+        "the seed must learn about the joiner too, from the joiner's own ping"
+    )
+
+
 async def test_detects_a_crashed_node_and_passes_through_suspect(cluster: Cluster):
     a = cluster.add()
     b = cluster.add(seeds=[a.addr])

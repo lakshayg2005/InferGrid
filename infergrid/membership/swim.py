@@ -222,12 +222,26 @@ class SwimNode(asyncio.DatagramProtocol):
             self._pending.pop(seq, None)
 
     def _send(self, target_addr: str, message: dict) -> None:
-        message["gossip"] = self._take_gossip()
+        # Every message carries a fresh claim of our own aliveness, not just whatever
+        # limited-retransmit gossip happens to be pending. Without this, a node that
+        # joins (or rejoins after a restart) via --seeds only learns about a seed it
+        # successfully pings if that seed *happens* to have unexpired gossip about
+        # itself queued up -- which, in a cluster that has been running a while, it
+        # usually does not (self-announcements drain after gossip_retransmits sends).
+        # A bare successful ping/ack otherwise carries no proof of aliveness on its
+        # own: receiving an ack only resolves a pending future, it never updates
+        # self.members (see datagram_received). Found by scripts/store_chaos.py: a
+        # restarted store node's own alive_nodes() stayed {itself} indefinitely even
+        # though it was pinging its seeds successfully every round.
+        message["gossip"] = [self._self_announcement(), *self._take_gossip()]
         host, port = target_addr.rsplit(":", 1)
         try:
             self._transport.sendto(json.dumps(message).encode(), (host, int(port)))
         except OSError:
             pass  # unreachable right now; the next probe round will notice
+
+    def _self_announcement(self) -> list:
+        return [self.addr, ALIVE, self.incarnation, self.members[self.addr].metadata]
 
     def _take_gossip(self, limit: int = 6) -> list[list]:
         items = sorted(self._gossip.items(), key=lambda kv: -kv[1])[:limit]

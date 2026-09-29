@@ -183,23 +183,118 @@ was configured with; it does not (yet) drop or add HTTP routing candidates for
 members it discovers that were not in the static `--workers` list, so it is a
 liveness filter today, not a discovery mechanism.
 
-### 3.5 State store (replication + sharding)
+### 3.5 State store (replication + sharding) (`infergrid/store/`)
 A Dynamo-style leaderless key-value store, written from scratch:
 
 | Mechanism | Purpose |
 |---|---|
-| Consistent hashing with virtual nodes | Spread keys evenly; move only ~1/N of keys when a node joins |
-| Preference list of N=3 replicas | Survive two node failures |
-| Tunable quorums (R + W > N) | Choose consistency vs latency per operation |
-| Hybrid logical clock versions (vector clocks as stretch goal) | Order concurrent writes |
-| Hinted handoff | Accept writes while a replica is down, deliver later |
-| Read repair | Heal stale replicas during reads |
-| Merkle-tree anti-entropy (stretch) | Background repair of cold keys |
+| Consistent hashing with virtual nodes (same `common/hashring.py` as the router) | Spread keys evenly; move only ~1/N of keys when a node joins |
+| Preference list of `n_replicas` (default 3) | Survive `n_replicas - 1` node failures |
+| Tunable quorums (`w + r > n_replicas`, enforced at construction) | Choose consistency vs latency per node |
+| Hybrid logical clock versions (`store/clock.py`) | Order concurrent writes without vector clocks' bookkeeping |
+| Sloppy quorum + hinted handoff | Accept writes while a replica is down, deliver later |
+| Read repair | Heal stale or missing replicas during reads |
+| Merkle-tree anti-entropy (stretch, not built) | Background repair of keys nobody reads or rewrites after a crash |
 
 **Why leaderless and not Raft?** Chat history and cache entries favour
 availability: a user should still be able to chat during a partition. Rare
 conflicting writes to one conversation are acceptable and resolvable. Raft would
 make every write wait for one leader and stop writes in a minority partition.
+
+**Why HLC and not vector clocks?** A vector clock (one counter per node) detects
+true concurrency exactly, at the cost of growing with cluster size and needing
+client-side reconciliation when it finds a real conflict. A hybrid logical clock
+is a single, always-comparable `(physical_ns, logical, node_id)` triple: cheap,
+and its physical component stays meaningful as a timestamp, at the cost of
+resolving concurrent writes last-write-wins instead of surfacing the conflict.
+Acceptable here: conversation state overwriting to "whichever write's clock was
+later" loses at most one racing write to the same key at nearly the same
+instant, not silent corruption.
+
+**Two mechanisms make writes/reads reroute around a down node, reactively, not
+just when a failure detector has already noticed:**
+- *Write:* every preference-list node is tried; a node membership already knows
+  is down is skipped without spending a timeout on it, but any node -- known
+  dead or not -- whose write actually fails gets a spare substitute from further
+  round the ring, holding the write as a hint "for" the down node. The write
+  still counts toward `w`, so one down replica never blocks a write, and a
+  just-crashed node (before SWIM has caught up) is covered too, not only an
+  already-detected one.
+- *Read:* the same reactive substitution, topped up with spares until `r`
+  replicas have actually answered (not just been asked). The newest version by
+  HLC wins; any replica that answered stale or missing is repaired in the
+  background, not on the request's critical path.
+
+**Hinted handoff only heals what happened *while* a node was down.** Data a
+node already held *before* it crashed is gone from its (in-memory, unpersisted)
+storage on restart, and no hint exists for it, since nothing wrote it again
+during the outage -- that gap is closed lazily, the next time something reads
+an affected key and triggers read repair, not automatically. `scripts/store_chaos.py`
+checks these as two separate claims for exactly this reason (see its own
+docstring), rather than one blanket "the node recovered" assertion.
+
+**A real bug found via `scripts/store_chaos.py`, not by the fast in-process unit
+tests in `tests/test_store.py`:** a store node restarting mid-run, seeded on its
+peers via `--seeds` exactly like Phase 3's workers, had its own `alive_nodes()`
+stay `{itself}` indefinitely -- it was pinging its seeds successfully every
+round, but a bare successful ping/ack proves nothing about the target's
+aliveness on its own: `SwimNode.datagram_received` only calls `_update()` (the
+method that actually populates `self.members`) for entries in a message's
+piggybacked `gossip` list, never just because an ack came back. And a seed's
+gossip about *itself* is only pending for `gossip_retransmits` sends after
+`start()` -- in a cluster that had already been running for the tens of seconds
+`store_chaos.py`'s workload takes, that had long since drained on every seed. A
+freshly-started test cluster (`tests/test_swim.py`'s existing tests) never hit
+this, since every node's self-announcement is still fresh when a test's seeded
+node joins moments later -- which is exactly why a real multi-process run under
+realistic timing, not just a fast unit-test cluster, caught it. Fixed in
+`infergrid/membership/swim.py::_send`: every message now carries a fresh claim
+of the sender's own aliveness alongside whatever limited-retransmit gossip is
+pending, so a single successful ping/ack round-trip -- in either direction --
+is enough to introduce two nodes to each other, regardless of what either one
+happens to have queued up to say about itself at that moment.
+`tests/test_swim.py::test_a_late_joiner_learns_about_a_seed_with_no_pending_gossip_about_itself`
+force-drains a seed's self-gossip the same way the restart-incarnation test
+force-drains a dead report, to test the real fix rather than the timing
+coincidence that let it through before; confirmed to fail on the pre-fix code.
+
+**A second real bug, found the same way once the first was fixed:** even with
+membership converged, a write occasionally failed quorum against nodes that
+were never killed at all. `store/node.py`'s write path originally skipped a
+preference-list node proactively whenever it was not `ALIVE` -- which also
+excludes `SUSPECT`, SWIM's deliberate window of *uncertainty*, not evidence of
+failure. Each write fans out concurrent HTTP replication to 2-3 peers on the
+same single event loop that has to answer that node's own SWIM pings, so a
+coordinator busy replicating is slower to service its own ping/ack than
+Phase 3's workers ever were (they only generate tokens); under real load this
+was enough to tip a perfectly healthy peer into SUSPECT for a moment. Treating
+that as "skip it" burned through the small spare pool (as few as `nodes -
+n_replicas`, e.g. 1 spare in this project's default 4-node/n=3 setup) that a
+*real* failure needs, turning a false suspicion into an actual quorum failure.
+Fixed by only skipping a node once membership has confirmed it `DEAD`
+(`StoreNode._known_dead()`); a `SUSPECT` node still gets a genuine attempt,
+which succeeds immediately since it's actually up. Also widened the store's
+own SWIM timeouts past Phase 3's worker/gateway defaults
+(`infergrid/store/__main__.py`: 1.0s ping / 4.0s suspicion vs 0.5s / 2.0s) to
+give the heavier per-request replication fan-out more headroom.
+
+**An open, honestly-unresolved finding, not papered over:** even after both
+fixes, `scripts/store_chaos.py` still occasionally (roughly 1 run in 5-6 at the
+default 4 nodes, more often at 5) hits a *stable* membership partition -- one
+or more nodes settle into seeing only themselves or one other node, and stay
+that way for the rest of the run rather than self-healing within a few
+protocol periods the way a genuinely transient suspicion does. This looks like
+sustained event-loop/OS scheduling contention from running 4-5 full
+Python/uvicorn processes with real concurrent UDP and HTTP traffic on one
+machine (this project targets a modest, GPU-less, 8 GB dev machine, not a
+server-grade box), not a specific line of code identified with confidence in
+the time available. `write_batch` in `scripts/store_chaos.py` records a failed
+write instead of crashing so a run surfaces this as data (a `FAIL` with a
+`write FAILED` count) rather than an unhandled traceback. Documented here
+rather than hidden, in the same spirit as section 7's benchmark p99 gap: a
+real, reproducible limitation of a failure detector sharing an event loop with
+the workload it is trying to stay responsive under, worth its own investigation
+rather than a guessed fix.
 
 ### 3.6 Messaging (Kafka via Redpanda)
 - **Batch inference API** (`POST /v1/batches`): jobs go to a topic partitioned by
